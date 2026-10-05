@@ -1,4 +1,4 @@
-<!-- AI coding config version: 2026-10-05 — sourced from biofool/starter template.
+<!-- AI coding config version: 2026-10-06 — sourced from biofool/starter template.
      Shared settings across all biofool projects; see ~/.codeium/windsurf/memories/shared_template_config.md -->
 
 # CLAUDE.md
@@ -95,10 +95,12 @@ edit one, edit both.
   `scripts/audit-deps.sh` as a PR check instead. Lockfiles are always
   committed; exceptions live in a dated allowlist file with an issue link.
 
-- **Reply in Simplified Technical English (STE).** Write chat replies in
-  STE: short sentences, active voice, one instruction per sentence,
-  consistent terminology, no unexplained jargon. Applies to chat output
-  only — code, commit messages, and docs keep their normal style.
+- **Reply in Simplified Technical English (STE) — unless it hurts
+  clarity.** Write chat replies in STE: short sentences, active voice, one
+  instruction per sentence, consistent terminology, no unexplained jargon.
+  If strict STE would create confusion or ambiguity, drop it and write
+  whatever is briefest and clearest. Applies to chat output only — code,
+  commit messages, and docs keep their normal style.
 
 See `AGENTS.md` for the full text of each rule.
 
