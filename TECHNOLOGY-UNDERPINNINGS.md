@@ -1,0 +1,134 @@
+# Technology Underpinnings — listmonk
+
+listmonk is a self-hosted newsletter and mailing list manager. This document
+describes its main features and how they are implemented. File paths are
+relative to the repo root.
+
+## Stack at a glance
+
+- **Backend:** Go 1.26 (`go.mod`), [Echo](https://echo.labstack.com) HTTP
+  framework (`cmd/handlers.go`), PostgreSQL via `jmoiron/sqlx`
+  (`cmd/main.go`).
+- **Admin frontend:** server-side rendered HTML — Go templates in
+  `static/admin/views/`, partials in `static/admin/partials/`, client-side
+  interactivity via Alpine.js, CodeMirror (editors), Chart.js (analytics),
+  squire-rte (rich text), and `@knadh/oat` CSS. Built with Bun
+  (`static/admin/build.mjs`, `package.json`) into `static/admin/dist/`.
+- **Single binary:** all assets (SQL schema, queries, templates, i18n,
+  static files, frontend dist) are packed into the `listmonk` binary with
+  [stuffbin](https://github.com/knadh/stuffbin) — see `STATIC` in
+  `Makefile` and `make dist`.
+- **Config:** TOML file (`config.toml.sample`) merged with `LISTMONK_*`
+  env vars via koanf (`cmd/init.go`).
+- **Releases:** GoReleaser (`.goreleaser.yml`, `make release`), Docker
+  image via `Dockerfile` + `docker-entrypoint.sh`.
+
+## Application layout
+
+- `cmd/` — binary entrypoint and HTTP handlers. `cmd/main.go` builds the
+  shared `App` struct (db, core, manager, messengers, auth, bounce,
+  importer, media, i18n, paginator). `cmd/init.go` loads flags/config and
+  wires components. `cmd/handlers.go` registers all routes.
+- `internal/` — domain packages (see below).
+- `models/` — request/response types and `models.Queries`, the registry
+  that maps query names to the SQL in `queries/`.
+- `queries/` — hand-written SQL per domain (`subscribers.sql`,
+  `campaigns.sql`, `lists.sql`, `bounces.sql`, …), prepared at startup.
+- `schema.sql` — full PostgreSQL schema; `internal/migrations/` holds
+  incremental migrations applied by `--upgrade` (idempotent).
+- `permissions.json` — granular permission list for roles, packed into the
+  binary.
+
+## Feature → implementation
+
+### Campaigns and sending pipeline
+`cmd/campaigns.go` handles CRUD, preview, test sends, and scheduling.
+`internal/manager/manager.go` is the send engine: it pulls campaigns from
+Postgres, expands subscribers, renders templates, and pushes messages to
+messengers through a pipelined worker model (`pipe.go`, `message.go`).
+Rate limiting supports both a fixed rate and a sliding-window mode
+(`SlidingWindow`/`SlidingWindowRate` fields). Campaign stats and send
+speed are tracked per campaign (`CampStats`).
+
+### Messengers (email delivery)
+`internal/messenger/email/email.go` implements the `manager.Messenger`
+interface over SMTP (multiple SMTP servers with per-server limits are
+configured in Admin → Settings). `internal/messenger/postback/` supports
+postback/webhook-style delivery. Additional messengers plug in via the
+`Messenger` interface in `internal/manager`.
+
+### Subscribers, lists, opt-in
+`cmd/subscribers.go`, `cmd/lists.go`, `internal/core/subscribers.go`,
+`internal/core/subscriptions.go`. Public double opt-in forms, confirmation
+and one-click unsubscribe pages are rendered in `cmd/public.go` from
+templates in `static/public/`. CSV bulk import runs in
+`internal/subimporter/importer.go` (`cmd/import.go` handles the API).
+
+### Templates and content
+`cmd/templates.go` + `internal/core/templates.go`. Campaign and system
+email templates are Go `text/template`/`html/template` documents stored in
+Postgres; default e-mail templates ship in `static/email-templates/`.
+Media uploads go through `cmd/media.go` to the pluggable store in
+`internal/media/` (filesystem or S3-compatible).
+
+### Bounce processing
+`internal/bounce/bounce.go` orchestrates two paths:
+- **Mailbox scans** — `internal/bounce/mailbox/pop.go` polls a bounce
+  POP3 mailbox and parses DSN/ARF reports.
+- **Webhooks** — `internal/bounce/webhooks/` has receivers for SES,
+  SendGrid, Postmark, Forward Email, Lettermint, and Azure.
+Bounced subscribers are recorded and auto-blocklisted per settings
+(`internal/core/bounces.go`, `cmd/bounce.go`).
+
+### Transactional API
+`cmd/tx.go` exposes `POST /api/tx` (route in `cmd/handlers.go`) for
+templated transactional messages — used by other systems for welcome
+mails, notifications, etc., through the same manager/messenger pipeline.
+
+### Auth, users, roles
+`internal/auth/` implements session auth plus OIDC SSO (PKCE support).
+`cmd/users.go`, `cmd/roles.go` manage admin users and roles; permissions
+are enforced by the `pm()` middleware in `cmd/handlers.go` using
+`permissions.json`. `cmd/auth.go` handles login/logout.
+
+### Admin UI (SSR)
+`cmd/views.go` and `cmd/dashboard.go` render `static/admin/views/*.html`
+Go templates server-side (`c.Render`). Dynamic behavior comes from
+Alpine.js; the editor stack is CodeMirror + squire-rte; charts use
+Chart.js. The Bun build (`static/admin/build.mjs`) bundles assets to
+`static/admin/dist/`. The icon sprite is generated by
+`scripts/build-icons.py` from `static/admin/icons.txt`.
+
+### i18n
+`internal/i18n/` loads JSON language packs from `i18n/` (packed into the
+binary); admin strings live in `static/admin/i18n.txt`. Translations are
+managed via inlang (`project.inlang.json`).
+
+### Public pages, archive, tracking
+`cmd/public.go` serves subscription forms, opt-in confirm, unsubscribe,
+and preference pages. `cmd/archive.go` renders a public campaign archive
+plus an RSS feed. Open/click tracking endpoints live in
+`cmd/campaign_analytics.go`.
+
+### Events, logs, captcha
+`internal/events/` is an in-process event bus; `internal/buflog/` is an
+in-memory ring-buffer logger exposed on the Logs admin page;
+`internal/captcha/` protects public forms; `internal/notifs/` sends admin
+notifications (e.g. import finished).
+
+## Testing and CI
+
+- `go test ./...` (`make test`) — unit tests.
+- `tests/` — Playwright end-to-end suite (`tests/specs/`,
+  `playwright.config.js`, fixtures in `tests/fixtures/`).
+- `.github/workflows/` — CI; `.goreleaser.yml` — release pipeline
+  (`make release-dry` / `make release`).
+
+## Fork notes (biofool)
+
+- Upstream: `github.com/knadh/listmonk`. Fork adds only config/docs and
+  fixes destined for upstream PRs; branches for upstream PRs are cut from
+  `upstream/master` (see `CLAUDE.md`).
+- The admin frontend here is the SSR rewrite (Go templates + Alpine.js +
+  Bun), not the older Vue SPA — keep this in mind when reading upstream
+  docs from before the rewrite.
