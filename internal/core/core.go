@@ -68,11 +68,13 @@ var (
 )
 
 var (
-	regexFullTextQuery  = regexp.MustCompile(`\s+`)
-	regexpSpaces        = regexp.MustCompile(`[\s]+`)
-	campQuerySortFields = []string{"name", "status", "created_at", "updated_at"}
-	subQuerySortFields  = []string{"email", "status", "name", "created_at", "updated_at"}
-	listQuerySortFields = []string{"name", "status", "created_at", "updated_at", "subscriber_count"}
+	regexpSpaces            = regexp.MustCompile(`[\s]+`)
+	campQuerySortFields     = []string{"name", "status", "created_at", "updated_at"}
+	subQuerySortFields      = []string{"email", "status", "name", "created_at", "updated_at"}
+	userQuerySortFields     = []string{"username", "email", "created_at", "loggedin_at"}
+	roleQuerySortFields     = []string{"name", "created_at", "updated_at"}
+	templateQuerySortFields = []string{"name", "type", "created_at", "updated_at"}
+	listQuerySortFields     = []string{"name", "status", "created_at", "updated_at", "subscriber_count"}
 )
 
 // New returns a new instance of the core.
@@ -151,12 +153,12 @@ func makeSearchQuery(searchStr, orderBy, order, query string, querySortFields []
 	return searchStr, query
 }
 
-// makeSearchString prepares a search string for use in both tsquery and ILIKE queries.
+// makeSearchString normalizes a search string for use in SQL search queries.
 func makeSearchString(searchStr string) string {
 	if searchStr == "" {
 		return ""
 	}
-	return `%` + string(regexFullTextQuery.ReplaceAll([]byte(searchStr), []byte("&"))) + `%`
+	return regexpSpaces.ReplaceAllString(strings.TrimSpace(searchStr), " ")
 }
 
 // strSliceContains checks if a string is present in the string slice.

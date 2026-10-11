@@ -7,10 +7,12 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -23,12 +25,13 @@ import (
 )
 
 type OIDCclaim struct {
-	Email             string `json:"email"`
-	EmailVerified     bool   `json:"email_verified"`
-	Sub               string `json:"sub"`
-	Picture           string `json:"picture"`
-	Name              string `json:"name"`
-	PreferredUsername string `json:"preferred_username"`
+	Email             string                     `json:"email"`
+	EmailVerified     bool                       `json:"email_verified"`
+	Sub               string                     `json:"sub"`
+	Picture           string                     `json:"picture"`
+	Name              string                     `json:"name"`
+	PreferredUsername string                     `json:"preferred_username"`
+	RawClaims         map[string]json.RawMessage `json:"-"`
 }
 
 type OIDCConfig struct {
@@ -72,6 +75,9 @@ type Auth struct {
 	sessStore *postgres.Store
 	cb        *Callbacks
 	log       *log.Logger
+
+	// Whether the OIDC provider supports PKCE with the S256 challenge method.
+	pkce bool
 }
 
 var sessPruneInterval = time.Hour * 12
@@ -171,6 +177,17 @@ func (o *Auth) initOIDC() error {
 	}
 	o.provider = provider
 
+	// Only use PKCE (RFC 7636) if the provider's metadata advertises it, as providers
+	// that don't support it may reject the extra params.
+	var meta struct {
+		CodeChallengeMethods []string `json:"code_challenge_methods_supported"`
+	}
+	if err := provider.Claims(&meta); err != nil {
+		o.log.Printf("error reading OIDC provider metadata: %v", err)
+	} else {
+		o.pkce = slices.Contains(meta.CodeChallengeMethods, "S256")
+	}
+
 	return nil
 }
 
@@ -200,38 +217,58 @@ func (o *Auth) getVerifier() (*oidc.IDTokenVerifier, error) {
 	return o.verifier, nil
 }
 
-// getOAuthConfig returns the OAuth config, initializing it if necessary.
-func (o *Auth) getOAuthConfig() (*oauth2.Config, error) {
+// getOAuthConfig returns the OAuth config and whether the provider supports PKCE,
+// initializing them if necessary.
+func (o *Auth) getOAuthConfig() (*oauth2.Config, bool, error) {
 	o.Lock()
 	defer o.Unlock()
 
 	if o.oauthCfg.ClientID == "" {
 		if err := o.initOIDC(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return &o.oauthCfg, nil
+	return &o.oauthCfg, o.pkce, nil
 }
 
-// GetOIDCAuthURL returns the OIDC provider's auth URL to redirect to.
-func (o *Auth) GetOIDCAuthURL(state, nonce string) string {
-	cfg, err := o.getOAuthConfig()
+// GetOIDCAuthURL returns the OIDC provider's auth URL to redirect to and the PKCE code
+// verifier for the subsequent token exchange, empty if the provider doesn't support PKCE.
+func (o *Auth) GetOIDCAuthURL(state, nonce string) (string, string) {
+	cfg, pkce, err := o.getOAuthConfig()
 	if err != nil {
 		o.log.Printf("error getting OAuth config: %v", err)
-		return ""
+		return "", ""
 	}
-	return cfg.AuthCodeURL(state, oidc.Nonce(nonce))
+
+	opts := []oauth2.AuthCodeOption{oidc.Nonce(nonce)}
+
+	codeVerifier := ""
+	if pkce {
+		codeVerifier = oauth2.GenerateVerifier()
+		opts = append(opts, oauth2.S256ChallengeOption(codeVerifier))
+	}
+
+	return cfg.AuthCodeURL(state, opts...), codeVerifier
 }
 
-// ExchangeOIDCToken takes an OIDC authorization code (recieved via redirect from the OIDC provider),
-// validates it, and returns an OIDC token for subsequent auth.
-func (o *Auth) ExchangeOIDCToken(code, nonce string) (string, OIDCclaim, error) {
-	cfg, err := o.getOAuthConfig()
+// ExchangeOIDCToken takes an OIDC authorization code (received via redirect from the OIDC provider)
+// and the PKCE code verifier from the auth request, validates it, and returns an OIDC token for
+// subsequent auth.
+func (o *Auth) ExchangeOIDCToken(code, nonce, codeVerifier string) (string, OIDCclaim, error) {
+	cfg, pkce, err := o.getOAuthConfig()
 	if err != nil {
 		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("error getting OAuth config: %v", err))
 	}
 
-	tk, err := cfg.Exchange(context.TODO(), code)
+	var opts []oauth2.AuthCodeOption
+	if pkce {
+		if codeVerifier == "" {
+			return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, "PKCE code verifier missing")
+		}
+		opts = append(opts, oauth2.VerifierOption(codeVerifier))
+	}
+
+	tk, err := cfg.Exchange(context.TODO(), code, opts...)
 	if err != nil {
 		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("error exchanging token: %v", err))
 	}
@@ -260,6 +297,11 @@ func (o *Auth) ExchangeOIDCToken(code, nonce string) (string, OIDCclaim, error) 
 		return "", OIDCclaim{}, errors.New("error getting user from OIDC")
 	}
 
+	// Preserve verified ID token claims for role mapping. UserInfo must not replace these.
+	if err := idTk.Claims(&claims.RawClaims); err != nil {
+		return "", OIDCclaim{}, errors.New("error getting raw claims from OIDC")
+	}
+
 	// If claims doesn't have the e-mail, attempt to fetch it from the userinfo endpoint.
 	if claims.Email == "" {
 		provider, err := o.getProvider()
@@ -272,10 +314,21 @@ func (o *Auth) ExchangeOIDCToken(code, nonce string) (string, OIDCclaim, error) 
 			return "", OIDCclaim{}, errors.New("error fetching user info from OIDC")
 		}
 
+		if userInfo.Subject != idTk.Subject {
+			return "", OIDCclaim{}, errors.New("OIDC UserInfo subject did not match")
+		}
+
+		// Verification must apply to the email supplied by UserInfo.
+		claims.EmailVerified = false
+
 		// Parse the UserInfo claims into the claims struct
 		if err := userInfo.Claims(&claims); err != nil {
 			return "", OIDCclaim{}, errors.New("error parsing user info claims")
 		}
+	}
+
+	if !claims.EmailVerified {
+		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, "OIDC email is not verified")
 	}
 
 	return rawIDTk, claims, nil
@@ -425,6 +478,10 @@ func (o *Auth) validateSession(c echo.Context) (*simplesessions.Session, User, e
 	user, err := o.cb.GetUser(userID)
 	if err != nil {
 		o.log.Printf("error fetching session user: %v", err)
+	}
+
+	if err == nil && user.Status != UserStatusEnabled {
+		return nil, User{}, echo.NewHTTPError(http.StatusForbidden, "user is disabled")
 	}
 
 	return sess, user, err

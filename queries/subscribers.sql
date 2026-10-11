@@ -56,6 +56,7 @@ WITH subs AS (
                     lists.*
             ) l)
         )
+        ORDER BY subscriber_lists.created_at, subscriber_lists.list_id
     ) AS lists FROM lists
     LEFT JOIN subscriber_lists ON (subscriber_lists.list_id = lists.id)
     WHERE subscriber_lists.subscriber_id = ANY($1)
@@ -252,6 +253,7 @@ UPDATE subscriber_lists SET status='unsubscribed', updated_at=NOW()
 -- Unsubscribes a subscriber given a campaign UUID (from all the lists in the campaign) and the subscriber UUID.
 -- If $3 is TRUE, then all subscriptions of the subscriber is blocklisted
 -- and all existing subscriptions, irrespective of lists, unsubscribed.
+-- Otherwise, if $4 is TRUE, unsubscribe ALL unconfirmed subscriptions irrespective of campaign.
 WITH lists AS (
     SELECT list_id FROM campaign_lists
     LEFT JOIN campaigns ON (campaign_lists.campaign_id = campaigns.id)
@@ -263,8 +265,11 @@ sub AS (
 )
 UPDATE subscriber_lists SET status = 'unsubscribed', updated_at=NOW() WHERE
     subscriber_id = (SELECT id FROM sub) AND status != 'unsubscribed' AND
-    -- If $3 is false, unsubscribe from the campaign's lists, otherwise all lists.
-    CASE WHEN $3 IS FALSE THEN list_id = ANY(SELECT list_id FROM lists) ELSE list_id != 0 END;
+    CASE
+        WHEN $3 IS TRUE THEN list_id != 0
+        WHEN $4 IS TRUE THEN status = 'unconfirmed'
+        ELSE list_id = ANY(SELECT list_id FROM lists)
+    END;
 
 -- name: unsubscribe-unconfirmed-subscriptions
 -- Marks a subscriber's unconfirmed (pending double opt-in) subscriptions as unsubscribed.
@@ -292,32 +297,40 @@ DELETE FROM subscriber_lists
 -- there's a COUNT() OVER() that still returns the total result count
 -- for pagination in the frontend, albeit being a field that'll repeat
 -- with every resultant row.
-SELECT subscribers.* FROM subscribers
+SELECT DISTINCT subscribers.* FROM subscribers
     LEFT JOIN subscriber_lists
     ON (
         -- Optional list filtering.
-        (CASE WHEN CARDINALITY($1::INT[]) > 0 THEN true ELSE false END)
+        (CARDINALITY($1::INT[]) > 0 OR $2 != '')
         AND subscriber_lists.subscriber_id = subscribers.id
         AND ($2 = '' OR subscriber_lists.status = $2::subscription_status)
     )
     WHERE (CARDINALITY($1) = 0 OR subscriber_lists.list_id = ANY($1::INT[]))
-    AND (CASE WHEN $3 != '' THEN name ~* $3 OR email ~* $3 ELSE TRUE END)
-    AND %query%
+    AND ($2 = '' OR subscriber_lists.subscriber_id IS NOT NULL)
+    AND (CASE WHEN $3 != '' THEN
+        name ~* ('***=' || $3) OR email ~* ('***=' || $3)
+        ELSE TRUE END)
+    AND ($6 = '' OR subscribers.status = $6::subscriber_status)
+    AND (%query%)
     ORDER BY %order% OFFSET $4 LIMIT (CASE WHEN $5 < 1 THEN NULL ELSE $5 END);
 
 -- name: query-subscribers-count
 -- Replica of query-subscribers for obtaining the results count.
-SELECT COUNT(*) AS total FROM subscribers
+SELECT COUNT(DISTINCT subscribers.id) AS total FROM subscribers
     LEFT JOIN subscriber_lists
     ON (
         -- Optional list filtering.
-        (CASE WHEN CARDINALITY($1::INT[]) > 0 THEN true ELSE false END)
+        (CARDINALITY($1::INT[]) > 0 OR $2 != '')
         AND subscriber_lists.subscriber_id = subscribers.id
         AND ($2 = '' OR subscriber_lists.status = $2::subscription_status)
     )
     WHERE (CARDINALITY($1) = 0 OR subscriber_lists.list_id = ANY($1::INT[]))
-    AND (CASE WHEN $3 != '' THEN name ~* $3 OR email ~* $3 ELSE TRUE END)
-    AND %query%;
+    AND ($2 = '' OR subscriber_lists.subscriber_id IS NOT NULL)
+    AND (CASE WHEN $3 != '' THEN
+        name ~* ('***=' || $3) OR email ~* ('***=' || $3)
+        ELSE TRUE END)
+    AND ($4 = '' OR subscribers.status = $4::subscriber_status)
+    AND (%query%);
 
 -- name: query-subscribers-count-all
 -- Cached query for getting the "all" subscriber count without arbitrary conditions.
@@ -329,7 +342,7 @@ SELECT COALESCE(SUM(subscriber_count), 0) AS total FROM mat_list_subscriber_stat
 -- raw: true
 -- Unprepared statement for issuring arbitrary WHERE conditions for
 -- searching subscribers to do bulk CSV export.
-SELECT subscribers.id,
+SELECT DISTINCT subscribers.id,
        subscribers.uuid,
        subscribers.email,
        subscribers.name,
@@ -341,14 +354,18 @@ SELECT subscribers.id,
     LEFT JOIN subscriber_lists
     ON (
         -- Optional list filtering.
-        (CASE WHEN CARDINALITY($1::INT[]) > 0 THEN true ELSE false END)
+        (CARDINALITY($1::INT[]) > 0 OR $4 != '')
         AND subscriber_lists.subscriber_id = subscribers.id
         AND ($4 = '' OR subscriber_lists.status = $4::subscription_status)
     )
-    WHERE subscriber_lists.list_id = ALL($1::INT[]) AND id > $2
+    WHERE (CARDINALITY($1::INT[]) = 0 OR subscriber_lists.list_id = ANY($1)) AND id > $2
+    AND ($4 = '' OR subscriber_lists.subscriber_id IS NOT NULL)
     AND (CASE WHEN CARDINALITY($3::INT[]) > 0 THEN id=ANY($3) ELSE true END)
-    AND (CASE WHEN $5 != '' THEN name ~* $5 OR email ~* $5 ELSE TRUE END)
-    AND %query%
+    AND (CASE WHEN $5 != '' THEN
+        name ~* ('***=' || $5) OR email ~* ('***=' || $5)
+        ELSE TRUE END)
+    AND ($7 = '' OR subscribers.status = $7::subscriber_status)
+    AND (%query%)
     ORDER BY subscribers.id ASC LIMIT (CASE WHEN $6 < 1 THEN NULL ELSE $6 END);
 
 -- name: query-subscribers-template
@@ -358,19 +375,23 @@ SELECT subscribers.id,
 -- and for the same reason, it is not terminated with a semicolon.
 --
 -- All queries that embed this query should expect
--- $1=true/false (dry-run or not) and $2=[]INT (option list IDs).
--- That is, their positional arguments should start from $4.
-SELECT subscribers.id FROM subscribers
+-- $1=dry-run, $2=list IDs, $3=subscription status, $4=search, $5=subscriber status.
+-- Their positional arguments should start from $6.
+SELECT DISTINCT subscribers.id FROM subscribers
 LEFT JOIN subscriber_lists
 ON (
     -- Optional list filtering.
-    (CASE WHEN CARDINALITY($2::INT[]) > 0 THEN true ELSE false END)
+    (CARDINALITY($2::INT[]) > 0 OR $3 != '')
     AND subscriber_lists.subscriber_id = subscribers.id
     AND ($3 = '' OR subscriber_lists.status = $3::subscription_status)
 )
-WHERE subscriber_lists.list_id = ALL($2::INT[])
-    AND (CASE WHEN $4 != '' THEN name ~* $4 OR email ~* $4 ELSE TRUE END)
-    AND %query%
+WHERE (CARDINALITY($2::INT[]) = 0 OR subscriber_lists.list_id = ANY($2))
+    AND ($3 = '' OR subscriber_lists.subscriber_id IS NOT NULL)
+    AND (CASE WHEN $4 != '' THEN
+        name ~* ('***=' || $4) OR email ~* ('***=' || $4)
+        ELSE TRUE END)
+    AND ($5 = '' OR subscribers.status = $5::subscriber_status)
+    AND (%query%)
 LIMIT (CASE WHEN $1 THEN 1 END)
 
 -- name: delete-subscribers-by-query
@@ -392,20 +413,20 @@ UPDATE subscriber_lists SET status='unsubscribed', updated_at=NOW()
 -- raw: true
 WITH subs AS (%query%)
 INSERT INTO subscriber_lists (subscriber_id, list_id, status)
-    (SELECT a, b, (CASE WHEN $6 != '' THEN $6::subscription_status ELSE 'unconfirmed' END) FROM UNNEST(ARRAY(SELECT id FROM subs)) a, UNNEST($5::INT[]) b)
+    (SELECT a, b, (CASE WHEN $7 != '' THEN $7::subscription_status ELSE 'unconfirmed' END) FROM UNNEST(ARRAY(SELECT id FROM subs)) a, UNNEST($6::INT[]) b)
     ON CONFLICT (subscriber_id, list_id) DO NOTHING;
 
 -- name: delete-subscriptions-by-query
 -- raw: true
 WITH subs AS (%query%)
 DELETE FROM subscriber_lists
-    WHERE (subscriber_id, list_id) = ANY(SELECT a, b FROM UNNEST(ARRAY(SELECT id FROM subs)) a, UNNEST($5::INT[]) b);
+    WHERE (subscriber_id, list_id) = ANY(SELECT a, b FROM UNNEST(ARRAY(SELECT id FROM subs)) a, UNNEST($6::INT[]) b);
 
 -- name: unsubscribe-subscribers-from-lists-by-query
 -- raw: true
 WITH subs AS (%query%)
 UPDATE subscriber_lists SET status='unsubscribed', updated_at=NOW()
-    WHERE (subscriber_id, list_id) = ANY(SELECT a, b FROM UNNEST(ARRAY(SELECT id FROM subs)) a, UNNEST($5::INT[]) b);
+    WHERE (subscriber_id, list_id) = ANY(SELECT a, b FROM UNNEST(ARRAY(SELECT id FROM subs)) a, UNNEST($6::INT[]) b);
 
 
 -- privacy
@@ -439,6 +460,12 @@ SELECT (SELECT email FROM prof) as email,
         COALESCE((SELECT JSON_AGG(t) FROM subs t), '[]') AS subscriptions,
         COALESCE((SELECT JSON_AGG(t) FROM views t), '[]') AS campaign_views,
         COALESCE((SELECT JSON_AGG(t) FROM clicks t), '[]') AS link_clicks;
+
+-- name: delete-subscriber-campaign-views
+DELETE FROM campaign_views WHERE subscriber_id = $1;
+
+-- name: delete-subscriber-link-clicks
+DELETE FROM link_clicks WHERE subscriber_id = $1;
 
 -- name: get-subscriber-activity
 -- Gets the subscriber's campaign views and link clicks with detailed information

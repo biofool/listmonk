@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"errors"
 	"net/http"
 	"net/url"
 	"path"
@@ -51,6 +51,8 @@ func initHTTPHandlers(e *echo.Echo, a *App) {
 	// =================================================================
 	// Authenticated non /api handlers.
 	{
+		pm := a.auth.Perm
+
 		// Attach a middleware to the group that checks for auth.
 		g := e.Group("", a.auth.Middleware, func(next echo.HandlerFunc) echo.HandlerFunc {
 			return func(c echo.Context) error {
@@ -65,15 +67,64 @@ func initHTTPHandlers(e *echo.Echo, a *App) {
 					return c.Redirect(http.StatusTemporaryRedirect, u.String())
 				}
 
-				return next(c)
+				err := next(c)
+				var httpErr *echo.HTTPError
+				if errors.As(err, &httpErr) && httpErr.Code == http.StatusForbidden && !c.Response().Committed {
+					return a.renderAdminMessage(c, "Error", a.i18n.Ts("globals.messages.permissionDenied", "name", c.Path()))
+				}
+
+				return err
 			}
 		})
 
-		// Authenticated endpoints.
-		g.GET(path.Join(uriAdmin, ""), a.AdminPage)
+		// Authenticated endpoints. As views are ported to the SSR admin, register
+		// their routes here. Unported /admin/* paths fall through to the 404 handler.
 		g.GET(path.Join(uriAdmin, "/custom.css"), serveCustomAppearance("admin.custom_css"))
 		g.GET(path.Join(uriAdmin, "/custom.js"), serveCustomAppearance("admin.custom_js"))
-		g.GET(path.Join(uriAdmin, "/*"), a.AdminPage)
+		g.GET(uriAdmin, a.ViewDashboard)
+		g.GET(path.Join(uriAdmin, "/lists"), a.ViewLists)
+		g.GET(path.Join(uriAdmin, "/lists/new"), pm(a.ViewNewList, "lists:manage_all"))
+		g.GET(path.Join(uriAdmin, "/lists/:id"), hasID(a.ViewList))
+		g.GET(path.Join(uriAdmin, "/lists/forms"), a.ViewForms)
+		g.GET(path.Join(uriAdmin, "/campaigns"), pm(a.ViewCampaigns, "campaigns:get_all", "campaigns:get"))
+		g.GET(path.Join(uriAdmin, "/campaigns/media"), pm(a.ViewMedia, "media:get"))
+		g.GET(path.Join(uriAdmin, "/campaigns/media/fragment"), pm(a.ViewMediaFragment, "media:get"))
+		g.GET(path.Join(uriAdmin, "/campaigns/analytics"), pm(a.ViewCampaignAnalytics, "campaigns:get_analytics"))
+		g.GET(path.Join(uriAdmin, "/campaigns/new"), pm(a.ViewNewCampaign, "campaigns:manage_all", "campaigns:manage"))
+		g.GET(path.Join(uriAdmin, "/campaigns/:id"), pm(hasID(a.ViewCampaign), "campaigns:get_all", "campaigns:get"))
+		g.GET(path.Join(uriAdmin, "/campaigns/:id/:tab"), pm(hasID(a.ViewCampaign), "campaigns:get_all", "campaigns:get"))
+		g.GET(path.Join(uriAdmin, "/templates"), pm(a.ViewTemplates, "templates:get"))
+		g.GET(path.Join(uriAdmin, "/templates/new"), pm(a.ViewNewTemplate, "templates:manage"))
+		g.GET(path.Join(uriAdmin, "/templates/:id"), pm(hasID(a.ViewTemplate), "templates:get"))
+		g.GET(path.Join(uriAdmin, "/subscribers/import"), pm(a.ViewImport, "subscribers:import"))
+		g.GET(path.Join(uriAdmin, "/subscribers/bounces"), pm(a.ViewBounces, "bounces:get"))
+		g.GET(path.Join(uriAdmin, "/subscribers"), pm(a.ViewSubscribers, "subscribers:get_all", "subscribers:get"))
+		g.POST(path.Join(uriAdmin, "/subscribers"), pm(a.ViewSubscribers, "subscribers:get_all", "subscribers:get"))
+		g.GET(path.Join(uriAdmin, "/subscribers/lists/:id"), pm(hasID(a.ViewSubscribers), "subscribers:get_all", "subscribers:get"))
+		g.POST(path.Join(uriAdmin, "/subscribers/lists/:id"), pm(hasID(a.ViewSubscribers), "subscribers:get_all", "subscribers:get"))
+		g.GET(path.Join(uriAdmin, "/subscribers/new"), pm(a.ViewNewSubscriber, "subscribers:manage"))
+		g.GET(path.Join(uriAdmin, "/subscribers/:id"), pm(hasID(a.ViewSubscriber), "subscribers:get_all", "subscribers:get"))
+		g.GET(path.Join(uriAdmin, "/subscribers/:id/lists"), pm(hasID(a.ViewSubscriber), "subscribers:get_all", "subscribers:get"))
+		// This view renders both the subscriber profile and bounce records.
+		g.GET(path.Join(uriAdmin, "/subscribers/:id/bounces"), pm(pm(hasID(a.ViewSubscriberBounces), "bounces:get"), "subscribers:get_all", "subscribers:get"))
+		g.GET(path.Join(uriAdmin, "/subscribers/:id/activity"), pm(hasID(a.ViewSubscriberActivity), "subscribers:get_all", "subscribers:get"))
+
+		// Users and roles. Static segments are registered before the :id param routes.
+		g.GET(path.Join(uriAdmin, "/users"), pm(a.ViewUsers, "users:get"))
+		g.GET(path.Join(uriAdmin, "/users/new"), pm(a.ViewUser, "users:manage"))
+		g.GET(path.Join(uriAdmin, "/users/roles"), pm(a.ViewUserRoles, "roles:get"))
+		g.GET(path.Join(uriAdmin, "/users/roles/new"), pm(a.ViewUserRole, "roles:manage"))
+		g.GET(path.Join(uriAdmin, "/users/roles/lists"), pm(a.ViewListRoles, "roles:get"))
+		g.GET(path.Join(uriAdmin, "/users/roles/lists/new"), pm(a.ViewListRole, "roles:manage"))
+		g.GET(path.Join(uriAdmin, "/users/roles/lists/:id"), pm(hasID(a.ViewListRole), "roles:get"))
+		g.GET(path.Join(uriAdmin, "/users/roles/:id"), pm(hasID(a.ViewUserRole), "roles:get"))
+		g.GET(path.Join(uriAdmin, "/users/:id"), pm(hasID(a.ViewUser), "users:get"))
+		g.GET(path.Join(uriAdmin, "/user/profile"), a.ViewProfile)
+
+		// Settings.
+		g.GET(path.Join(uriAdmin, "/settings"), pm(a.ViewSettings, "settings:get"))
+		g.GET(path.Join(uriAdmin, "/settings/logs"), pm(a.ViewLogs, "settings:get"))
+		g.GET(path.Join(uriAdmin, "/settings/maintenance"), pm(a.ViewMaintenance, "settings:maintain"))
 	}
 
 	// =================================================================
@@ -104,6 +155,7 @@ func initHTTPHandlers(e *echo.Echo, a *App) {
 		g.GET("/api/lang/:lang", a.GetI18nLang)
 		g.GET("/api/dashboard/charts", a.GetDashboardCharts)
 		g.GET("/api/dashboard/counts", a.GetDashboardCounts)
+		g.GET("/api/dashboard/campaigns", a.GetDashboardCampaigns)
 
 		g.GET("/api/settings", pm(a.GetSettings, "settings:get"))
 		g.PUT("/api/settings", pm(a.UpdateSettings, "settings:manage"))
@@ -117,6 +169,7 @@ func initHTTPHandlers(e *echo.Echo, a *App) {
 		g.GET("/api/subscribers", pm(a.QuerySubscribers, "subscribers:get_all", "subscribers:get"))
 		g.GET("/api/subscribers/:id", pm(hasID(a.GetSubscriber), "subscribers:get_all", "subscribers:get"))
 		g.GET("/api/subscribers/:id/activity", pm(hasID(a.GetSubscriberActivity), "subscribers:get_all", "subscribers:get"))
+		g.DELETE("/api/subscribers/:id/activity/:type", pm(hasID(a.DeleteSubscriberActivity), "subscribers:manage"))
 		g.GET("/api/subscribers/:id/export", pm(hasID(a.ExportSubscriberData), "subscribers:get_all", "subscribers:get"))
 		g.GET("/api/subscribers/:id/bounces", pm(hasID(a.GetSubscriberBounces), "bounces:get"))
 		g.DELETE("/api/subscribers/:id/bounces", pm(hasID(a.DeleteSubscriberBounces), "bounces:manage"))
@@ -304,18 +357,6 @@ func initHTTPHandlers(e *echo.Echo, a *App) {
 			return echo.NewHTTPError(http.StatusNotFound, "404 page not found")
 		})
 	}
-}
-
-// AdminPage is the root handler that renders the Javascript admin frontend.
-func (a *App) AdminPage(c echo.Context) error {
-	b, err := a.fs.Read(path.Join(uriAdmin, "/index.html"))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	b = bytes.ReplaceAll(b, []byte("asset_version"), []byte(a.cfg.AssetVersion))
-
-	return c.HTMLBlob(http.StatusOK, b)
 }
 
 // HealthCheck is a healthcheck endpoint that returns a 200 response.

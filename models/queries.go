@@ -38,6 +38,8 @@ type Queries struct {
 	UnsubscribeUnconfirmed          *sqlx.Stmt `query:"unsubscribe-unconfirmed-subscriptions"`
 	ExportSubscriberData            *sqlx.Stmt `query:"export-subscriber-data"`
 	GetSubscriberActivity           *sqlx.Stmt `query:"get-subscriber-activity"`
+	DeleteSubscriberCampaignViews   *sqlx.Stmt `query:"delete-subscriber-campaign-views"`
+	DeleteSubscriberLinkClicks      *sqlx.Stmt `query:"delete-subscriber-link-clicks"`
 
 	// Non-prepared arbitrary subscriber queries.
 	QuerySubscribers                       string     `query:"query-subscribers"`
@@ -99,7 +101,7 @@ type Queries struct {
 	DeleteMedia *sqlx.Stmt `query:"delete-media"`
 
 	CreateTemplate     *sqlx.Stmt `query:"create-template"`
-	GetTemplates       *sqlx.Stmt `query:"get-templates"`
+	GetTemplates       string     `query:"get-templates"`
 	UpdateTemplate     *sqlx.Stmt `query:"update-template"`
 	SetDefaultTemplate *sqlx.Stmt `query:"set-default-template"`
 	DeleteTemplate     *sqlx.Stmt `query:"delete-template"`
@@ -126,15 +128,15 @@ type Queries struct {
 	UpdateUserLogin    *sqlx.Stmt `query:"update-user-login"`
 	SetUserTwoFA       *sqlx.Stmt `query:"set-user-twofa"`
 	DeleteUsers        *sqlx.Stmt `query:"delete-users"`
-	GetUsers           *sqlx.Stmt `query:"get-users"`
+	GetUsers           string     `query:"get-users"`
 	GetUser            *sqlx.Stmt `query:"get-user"`
 	GetAPITokens       *sqlx.Stmt `query:"get-api-tokens"`
 	LoginUser          *sqlx.Stmt `query:"login-user"`
 	DeleteUserSessions *sqlx.Stmt `query:"delete-user-sessions"`
 
 	CreateRole            *sqlx.Stmt `query:"create-role"`
-	GetUserRoles          *sqlx.Stmt `query:"get-user-roles"`
-	GetListRoles          *sqlx.Stmt `query:"get-list-roles"`
+	GetUserRoles          string     `query:"get-user-roles"`
+	GetListRoles          string     `query:"get-list-roles"`
 	UpdateRole            *sqlx.Stmt `query:"update-role"`
 	DeleteRole            *sqlx.Stmt `query:"delete-role"`
 	UpsertListPermissions *sqlx.Stmt `query:"upsert-list-permissions"`
@@ -146,7 +148,7 @@ type Queries struct {
 // out of it using the raw `query-subscribers-template` query template.
 // While doing this, a readonly transaction is created and the query is
 // dry run on it to ensure that it is indeed readonly.
-func (q *Queries) compileSubscriberQueryTpl(searchStr, queryExp string, db *sqlx.DB, subStatus string) (string, error) {
+func (q *Queries) compileSubscriberQueryTpl(searchStr, queryExp string, db *sqlx.DB, subStatus, subscriberStatus string) (string, error) {
 	tx, err := db.BeginTxx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return "", err
@@ -161,7 +163,7 @@ func (q *Queries) compileSubscriberQueryTpl(searchStr, queryExp string, db *sqlx
 
 	// Perform the dry run.
 	stmt := strings.ReplaceAll(q.QuerySubscribersTpl, "%query%", cond)
-	if _, err := tx.Exec(stmt, true, pq.Int64Array{}, subStatus, searchStr); err != nil {
+	if _, err := tx.Exec(stmt, true, pq.Int64Array{}, subStatus, searchStr, subscriberStatus); err != nil {
 		return "", err
 	}
 
@@ -171,9 +173,11 @@ func (q *Queries) compileSubscriberQueryTpl(searchStr, queryExp string, db *sqlx
 // compileSubscriberQueryTpl takes an arbitrary WHERE expressions and a subscriber
 // query template that depends on the filter (eg: delete by query, blocklist by query etc.)
 // combines and executes them.
-func (q *Queries) ExecSubQueryTpl(searchStr, queryExp, baseQueryTpl string, listIDs []int, db *sqlx.DB, subStatus string, args ...any) error {
+func (q *Queries) ExecSubQueryTpl(searchStr, queryExp, baseQueryTpl string, listIDs []int, db *sqlx.DB, subStatus, subscriberStatus string, args ...any) error {
+	queryExp, subStatus = ApplyOrphanFilter(queryExp, subStatus)
+
 	// Perform a dry run.
-	filterExp, err := q.compileSubscriberQueryTpl(searchStr, queryExp, db, subStatus)
+	filterExp, err := q.compileSubscriberQueryTpl(searchStr, queryExp, db, subStatus, subscriberStatus)
 	if err != nil {
 		return err
 	}
@@ -186,11 +190,25 @@ func (q *Queries) ExecSubQueryTpl(searchStr, queryExp, baseQueryTpl string, list
 	stmt := strings.ReplaceAll(baseQueryTpl, "%query%", filterExp)
 
 	// First argument is the boolean indicating if the query is a dry run.
-	a := append([]any{false, pq.Array(listIDs), subStatus, searchStr}, args...)
+	a := append([]any{false, pq.Array(listIDs), subStatus, searchStr, subscriberStatus}, args...)
 
 	// Execute the query on the DB.
 	if _, err := db.Exec(stmt, a...); err != nil {
 		return err
 	}
 	return nil
+}
+
+// ApplyOrphanFilter handles the special subscription_status value "none", which
+// filters orphan subscribers (no list subscriptions).
+func ApplyOrphanFilter(cond, subStatus string) (string, string) {
+	const orphanSubCond = "NOT EXISTS (SELECT 1 FROM subscriber_lists WHERE subscriber_id = subscribers.id)"
+	if subStatus == "none" {
+		if cond == "" {
+			cond = "TRUE"
+		}
+		return "(" + cond + ") AND " + orphanSubCond, ""
+	}
+
+	return cond, subStatus
 }

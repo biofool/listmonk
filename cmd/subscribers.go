@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/knadh/listmonk/internal/auth"
 	"github.com/knadh/listmonk/internal/i18n"
@@ -23,6 +24,19 @@ const (
 	dummyUUID = "00000000-0000-0000-0000-000000000000"
 )
 
+// subscribersQueryDefaults is the allow list of filter query params.
+var subscribersQueryDefaults = map[string]string{
+	"page":                "",
+	"per_page":            "",
+	"search":              "",
+	"query":               "",
+	"order_by":            "",
+	"order":               "",
+	"subscription_status": "",
+	"list_id":             "",
+	"status":              "",
+}
+
 // subQueryReq is a "catch all" struct for reading various
 // subscriber related requests.
 type subQueryReq struct {
@@ -34,6 +48,7 @@ type subQueryReq struct {
 	Action             string `json:"action"`
 	Status             string `json:"status"`
 	SubscriptionStatus string `json:"subscription_status"`
+	SubscriberStatus   string `json:"subscriber_status"`
 	All                bool   `json:"all"`
 }
 
@@ -54,6 +69,269 @@ var (
 		Attribs: models.JSON{"city": "Bengaluru"},
 	}
 )
+
+// subscribersView is the admin page view for the subscribers list page.
+type subscribersView struct {
+	adminView
+
+	Subscribers []models.Subscriber
+	Page        models.PageProps
+	AllLists    []models.List
+	CurrentList *models.List
+}
+
+// subscriberView is the admin page view for a single subscriber.
+type subscriberView struct {
+	adminView
+
+	IsNew         bool
+	Tab           string
+	Subscriber    models.Subscriber
+	AllLists      []models.List
+	Bounces       []models.Bounce
+	CampaignViews []subCampaignView
+	LinkClicks    []subLinkClick
+	TotalViews    int
+	TotalClicks   int
+}
+
+// subCampaignView and subLinkClick are the parsed rows of a subscriber's activity,
+// unmarshalled from the JSON returned by GetSubscriberActivity.
+type subCampaignView struct {
+	ID           int       `json:"id"`
+	Name         string    `json:"name"`
+	Subject      string    `json:"subject"`
+	ViewCount    int       `json:"view_count"`
+	LastViewedAt time.Time `json:"last_viewed_at"`
+}
+
+type subLinkClick struct {
+	URL             string    `json:"url"`
+	CampaignID      int       `json:"campaign_id"`
+	CampaignName    string    `json:"campaign_name"`
+	CampaignSubject string    `json:"campaign_subject"`
+	ClickCount      int       `json:"click_count"`
+	LastClickedAt   time.Time `json:"last_clicked_at"`
+}
+
+// ViewSubscribers renders the HTML view for subscribers, optionally filtered by a list.
+func (a *App) ViewSubscribers(c echo.Context) error {
+	listID, _ := strconv.Atoi(c.Param("id"))
+	if listID > 0 {
+		user := auth.GetUser(c)
+		if err := user.HasListPerm(auth.PermTypeGet, listID); err != nil {
+			return a.renderAdminMessage(c, "Error", a.i18n.Ts("globals.messages.permissionDenied", "name", "lists"))
+		}
+	}
+
+	subs, props, err := a.getSubscribers(c, listID)
+	if err != nil {
+		return err
+	}
+
+	// All lists the user can access, for the subscriber form's list selector.
+	allLists, err := a.getViewableLists(c)
+	if err != nil {
+		return err
+	}
+
+	// Fetch the list being filtered by, if any, to show its name in the header.
+	var curList *models.List
+	if listID > 0 {
+		if l, err := a.core.GetList(listID, ""); err == nil {
+			curList = &l
+		}
+	}
+
+	data := subscribersView{
+		adminView:   newAdminView(c, a.i18n.T("globals.terms.subscribers"), "", "subscribers.all"),
+		Subscribers: subs,
+		Page:        props,
+		AllLists:    allLists,
+		CurrentList: curList,
+	}
+
+	return c.Render(http.StatusOK, "admin-subscribers", data)
+}
+
+// ViewNewSubscriber renders the new subscriber page.
+func (a *App) ViewNewSubscriber(c echo.Context) error {
+	allLists, err := a.getViewableLists(c)
+	if err != nil {
+		return err
+	}
+
+	data := subscriberView{
+		adminView: newAdminView(c, fmt.Sprintf("%s / %s", a.i18n.T("subscribers.newSubscriber"), a.i18n.T("globals.terms.subscribers")), "", "subscribers.all"),
+		IsNew:     true,
+		AllLists:  allLists,
+	}
+
+	return c.Render(http.StatusOK, "admin-subscriber", data)
+}
+
+// ViewSubscriber renders the profile and subscriptions tabs of a subscriber.
+func (a *App) ViewSubscriber(c echo.Context) error {
+	out, err := a.getViewSubscriber(c)
+	if err != nil {
+		return err
+	}
+
+	allLists, err := a.getViewableLists(c)
+	if err != nil {
+		return err
+	}
+
+	tab := "profile"
+	if strings.HasSuffix(c.Path(), "/lists") {
+		tab = "lists"
+	}
+
+	data := subscriberView{
+		adminView:  newAdminView(c, out.Email+" / "+a.i18n.T("globals.terms.subscribers"), "", "subscribers.all"),
+		Tab:        tab,
+		Subscriber: out,
+		AllLists:   allLists,
+	}
+
+	return c.Render(http.StatusOK, "admin-subscriber", data)
+}
+
+// ViewSubscriberBounces renders the bounces tab of a subscriber.
+func (a *App) ViewSubscriberBounces(c echo.Context) error {
+	out, err := a.getViewSubscriber(c)
+	if err != nil {
+		return err
+	}
+
+	bounces, _, err := a.core.QueryBounces(0, out.ID, "", "", "", "", 0, 1000)
+	if err != nil {
+		return err
+	}
+
+	data := subscriberView{
+		adminView:  newAdminView(c, out.Email+" / "+a.i18n.T("globals.terms.subscribers"), "", "subscribers.all"),
+		Tab:        "bounces",
+		Subscriber: out,
+		Bounces:    bounces,
+	}
+
+	return c.Render(http.StatusOK, "admin-subscriber", data)
+}
+
+// ViewSubscriberActivity renders the activity tab (campaign views and link clicks) of a subscriber.
+func (a *App) ViewSubscriberActivity(c echo.Context) error {
+	out, err := a.getViewSubscriber(c)
+	if err != nil {
+		return err
+	}
+
+	act, err := a.core.GetSubscriberActivity(out.ID)
+	if err != nil {
+		return err
+	}
+
+	data := subscriberView{
+		adminView:  newAdminView(c, out.Email+" / "+a.i18n.T("globals.terms.subscribers"), "", "subscribers.all"),
+		Tab:        "activity",
+		Subscriber: out,
+	}
+
+	// Parse the JSON activity blobs.
+	_ = json.Unmarshal(act.CampaignViews, &data.CampaignViews)
+	_ = json.Unmarshal(act.LinkClicks, &data.LinkClicks)
+	for _, v := range data.CampaignViews {
+		data.TotalViews += v.ViewCount
+	}
+	for _, cl := range data.LinkClicks {
+		data.TotalClicks += cl.ClickCount
+	}
+
+	return c.Render(http.StatusOK, "admin-subscriber", data)
+}
+
+// getViewSubscriber fetches the subscriber in the request path after validating permissions.
+func (a *App) getViewSubscriber(c echo.Context) (models.Subscriber, error) {
+	user := auth.GetUser(c)
+
+	id := getID(c)
+	if err := a.hasSubPerm(user, []int{id}); err != nil {
+		return models.Subscriber{}, err
+	}
+
+	out, err := a.core.GetSubscriber(id, "", "")
+	if err != nil {
+		return models.Subscriber{}, err
+	}
+	maskRestrictedSubLists(user, &out)
+
+	return out, nil
+}
+
+// getViewableLists returns all active lists the user has access to.
+func (a *App) getViewableLists(c echo.Context) ([]models.List, error) {
+	user := auth.GetUser(c)
+
+	hasAllPerm, permittedIDs := user.GetPermittedLists(auth.PermTypeGet)
+	return a.core.GetLists("", models.ListStatusActive, hasAllPerm, permittedIDs)
+}
+
+// getSubscribers queries subscribers from query params for the HTML view. If listID > 0,
+// results are filtered by that list (the per-list subscribers view).
+func (a *App) getSubscribers(c echo.Context, listID int) ([]models.Subscriber, models.PageProps, error) {
+	// GET and POST are both supported. `query` (SQL query) is sent by the frontend
+	// as a POST form param.
+	params, err := c.FormParams()
+	if err != nil {
+		return nil, models.PageProps{}, err
+	}
+
+	q := makeQuery(params, subscribersQueryDefaults)
+
+	// Get the authenticated user.
+	user := auth.GetUser(c)
+
+	// Filter the list IDs by permission.
+	var listIDs []int
+	if listID > 0 {
+		listIDs = user.GetPermittedListIDs([]int{listID})
+	} else {
+		ids, err := a.filterListQueryByPerm("list_id", params, user)
+		if err != nil {
+			return nil, models.PageProps{}, err
+		}
+		listIDs = ids
+	}
+
+	// Does the user have the subscribers:sql_query permission for advanced queries?
+	query := formatSQLExp(q.Get("query"))
+	if query != "" && !user.HasPerm(auth.PermSubscribersSqlQuery) {
+		return nil, models.PageProps{}, echo.NewHTTPError(http.StatusForbidden,
+			a.i18n.Ts("globals.messages.permissionDenied", "name", auth.PermSubscribersSqlQuery))
+	}
+
+	// Run the DB query.
+	pg := a.pg.NewFromURL(q)
+	res, total, err := a.core.QuerySubscribers(
+		q.Get("search"),
+		query,
+		listIDs,
+		q.Get("subscription_status"),
+		q.Get("status"),
+		q.Get("order"),
+		q.Get("order_by"),
+		pg.Offset,
+		pg.Limit)
+	if err != nil {
+		return nil, models.PageProps{}, err
+	}
+
+	for i := range res {
+		maskRestrictedSubLists(user, &res[i])
+	}
+
+	return res, models.NewPageProps(q, total, pg.Page, pg.PerPage), nil
+}
 
 // GetSubscriber handles the retrieval of a single subscriber by ID.
 func (a *App) GetSubscriber(c echo.Context) error {
@@ -95,6 +373,20 @@ func (a *App) GetSubscriberActivity(c echo.Context) error {
 	return c.JSON(http.StatusOK, okResp{out})
 }
 
+// DeleteSubscriberActivity deletes a subscriber's campaign views or link clicks.
+func (a *App) DeleteSubscriberActivity(c echo.Context) error {
+	id := getID(c)
+	if err := a.hasSubPerm(auth.GetUser(c), []int{id}); err != nil {
+		return err
+	}
+
+	if err := a.core.DeleteSubscriberActivity(id, c.Param("type")); err != nil {
+		return err
+	}
+
+	return c.JSON(http.StatusOK, okResp{true})
+}
+
 // QuerySubscribers handles querying subscribers based on an arbitrary SQL expression.
 func (a *App) QuerySubscribers(c echo.Context) error {
 	// Get the authenticated user.
@@ -116,15 +408,16 @@ func (a *App) QuerySubscribers(c echo.Context) error {
 	}
 
 	var (
-		searchStr = strings.TrimSpace(c.FormValue("search"))
-		subStatus = c.FormValue("subscription_status")
-		order     = c.FormValue("order")
-		orderBy   = c.FormValue("order_by")
-		pg        = a.pg.NewFromURL(c.Request().URL.Query())
+		searchStr        = strings.TrimSpace(c.FormValue("search"))
+		subStatus        = c.FormValue("subscription_status")
+		subscriberStatus = c.FormValue("status")
+		order            = c.FormValue("order")
+		orderBy          = c.FormValue("order_by")
+		pg               = a.pg.NewFromURL(c.Request().URL.Query())
 	)
 
 	// Query subscribers from the DB.
-	res, total, err := a.core.QuerySubscribers(searchStr, query, listIDs, subStatus, order, orderBy, pg.Offset, pg.Limit)
+	res, total, err := a.core.QuerySubscribers(searchStr, query, listIDs, subStatus, subscriberStatus, order, orderBy, pg.Offset, pg.Limit)
 	if err != nil {
 		return err
 	}
@@ -134,12 +427,14 @@ func (a *App) QuerySubscribers(c echo.Context) error {
 	}
 
 	out := models.PageResults{
-		Query:   query,
-		Search:  searchStr,
 		Results: res,
-		Total:   total,
-		Page:    pg.Page,
-		PerPage: pg.PerPage,
+		PageProps: models.PageProps{
+			Query:   query,
+			Search:  searchStr,
+			Total:   total,
+			Page:    pg.Page,
+			PerPage: pg.PerPage,
+		},
 	}
 
 	return c.JSON(http.StatusOK, okResp{out})
@@ -178,7 +473,7 @@ func (a *App) ExportSubscribers(c echo.Context) error {
 	}
 
 	// Get the batched export iterator.
-	exp, err := a.core.ExportSubscribers(searchStr, query, subIDs, listIDs, subStatus, a.cfg.DBBatchSize)
+	exp, err := a.core.ExportSubscribers(searchStr, query, subIDs, listIDs, subStatus, c.QueryParam("status"), a.cfg.DBBatchSize)
 	if err != nil {
 		return err
 	}
@@ -573,11 +868,7 @@ func (a *App) DeleteSubscribersByQuery(c echo.Context) error {
 
 	req.Search = strings.TrimSpace(req.Search)
 	req.Query = formatSQLExp(req.Query)
-	if req.All {
-		// If the "all" flag is set, ignore any subquery that may be present.
-		req.Search = ""
-		req.Query = ""
-	} else if req.Search == "" && req.Query == "" {
+	if !req.All && req.Search == "" && req.Query == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, a.i18n.Ts("globals.messages.invalidFields", "name", "query"))
 	}
 
@@ -593,7 +884,7 @@ func (a *App) DeleteSubscribersByQuery(c echo.Context) error {
 	listIDs := user.GetPermittedListIDs(req.ListIDs)
 
 	// Delete the subscribers from the DB.
-	if err := a.core.DeleteSubscribersByQuery(req.Search, req.Query, listIDs, req.SubscriptionStatus); err != nil {
+	if err := a.core.DeleteSubscribersByQuery(req.Search, req.Query, listIDs, req.SubscriptionStatus, req.SubscriberStatus); err != nil {
 		return err
 	}
 
@@ -613,11 +904,7 @@ func (a *App) BlocklistSubscribersByQuery(c echo.Context) error {
 
 	req.Search = strings.TrimSpace(req.Search)
 	req.Query = formatSQLExp(req.Query)
-	if req.All {
-		// If the "all" flag is set, ignore any subquery that may be present.
-		req.Search = ""
-		req.Query = ""
-	} else if req.Search == "" && req.Query == "" {
+	if !req.All && req.Search == "" && req.Query == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, a.i18n.Ts("globals.messages.invalidFields", "name", "query"))
 	}
 	// Does the user have the subscribers:sql_query permission?
@@ -632,7 +919,7 @@ func (a *App) BlocklistSubscribersByQuery(c echo.Context) error {
 	listIDs := user.GetPermittedListIDs(req.ListIDs)
 
 	// Update the subscribers in the DB.
-	if err := a.core.BlocklistSubscribersByQuery(req.Search, req.Query, listIDs, req.SubscriptionStatus); err != nil {
+	if err := a.core.BlocklistSubscribersByQuery(req.Search, req.Query, listIDs, req.SubscriptionStatus, req.SubscriberStatus); err != nil {
 		return err
 	}
 
@@ -656,6 +943,9 @@ func (a *App) ManageSubscriberListsByQuery(c echo.Context) error {
 
 	req.Search = strings.TrimSpace(req.Search)
 	req.Query = formatSQLExp(req.Query)
+	if !req.All && req.Search == "" && req.Query == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, a.i18n.Ts("globals.messages.invalidFields", "name", "query"))
+	}
 
 	// Does the user have the subscribers:sql_query permission?
 	if req.Query != "" {
@@ -673,11 +963,11 @@ func (a *App) ManageSubscriberListsByQuery(c echo.Context) error {
 	var err error
 	switch req.Action {
 	case "add":
-		err = a.core.AddSubscriptionsByQuery(req.Search, req.Query, sourceListIDs, targetListIDs, req.Status, req.SubscriptionStatus)
+		err = a.core.AddSubscriptionsByQuery(req.Search, req.Query, sourceListIDs, targetListIDs, req.Status, req.SubscriptionStatus, req.SubscriberStatus)
 	case "remove":
-		err = a.core.DeleteSubscriptionsByQuery(req.Search, req.Query, sourceListIDs, targetListIDs, req.SubscriptionStatus)
+		err = a.core.DeleteSubscriptionsByQuery(req.Search, req.Query, sourceListIDs, targetListIDs, req.SubscriptionStatus, req.SubscriberStatus)
 	case "unsubscribe":
-		err = a.core.UnsubscribeListsByQuery(req.Search, req.Query, sourceListIDs, targetListIDs, req.SubscriptionStatus)
+		err = a.core.UnsubscribeListsByQuery(req.Search, req.Query, sourceListIDs, targetListIDs, req.SubscriptionStatus, req.SubscriberStatus)
 	default:
 		return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("subscribers.invalidAction"))
 	}

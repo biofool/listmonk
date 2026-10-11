@@ -45,8 +45,9 @@ func install(lastVer string, db *sqlx.DB, fs stuffbin.FileSystem, prompt, idempo
 	// If idempotence is on, check if the DB is already setup.
 	if idempotent {
 		if _, err := db.Exec("SELECT count(*) FROM settings"); err != nil {
-			// If "settings" doesn't exist, assume it's a fresh install.
-			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code != "42P01" {
+			// Treat missing "settings" table (42P01) as a fresh install.
+			// Abort on all other errors to not end up in a half-baked state.
+			if !isTableNotExistErr(err) {
 				lo.Fatalf("error checking existing DB schema: %v", err)
 			}
 		} else {
@@ -279,9 +280,13 @@ func installCampaign(campTplID, archiveTplID int, q *models.Queries) {
 // recordMigrationVersion inserts the given version (of DB migration) into the
 // `migrations` array in the settings table.
 func recordMigrationVersion(ver string, db *sqlx.DB) error {
-	_, err := db.Exec(fmt.Sprintf(`INSERT INTO settings (key, value)
-	VALUES('migrations', '["%s"]'::JSONB)
-	ON CONFLICT (key) DO UPDATE SET value = settings.value || EXCLUDED.value`, ver))
+	verJSON, err := json.Marshal([]string{ver})
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO settings (key, value)
+	VALUES('migrations', $1::JSONB)
+	ON CONFLICT (key) DO UPDATE SET value = settings.value || EXCLUDED.value`, string(verJSON))
 	return err
 }
 
@@ -292,7 +297,7 @@ func newConfigFile(path string) error {
 
 	// Initialize the static file system into which all
 	// required static assets (.sql, .js files etc.) are loaded.
-	fs := initFS(appDir, "", "", "")
+	fs := initFS(appDir, "", "")
 	b, err := fs.Read("config.toml.sample")
 	if err != nil {
 		return fmt.Errorf("error reading sample config (is binary stuffed?): %v", err)

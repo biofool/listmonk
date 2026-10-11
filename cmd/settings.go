@@ -13,7 +13,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gdgvda/cron"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jmoiron/sqlx/types"
 	koanfjson "github.com/knadh/koanf/parsers/json"
@@ -61,7 +60,14 @@ func (a *App) GetSettings(c echo.Context) error {
 		return err
 	}
 
-	// Empty out passwords.
+	maskSettings(&s)
+
+	return c.JSON(http.StatusOK, okResp{s})
+}
+
+// maskSettings replaces sensitive values (passwords, secrets, keys) in the
+// settings with masked placeholders of the same length.
+func maskSettings(s *models.Settings) {
 	for i := range s.SMTP {
 		s.SMTP[i].Password = strings.Repeat(pwdMask, utf8.RuneCountInString(s.SMTP[i].Password))
 	}
@@ -80,8 +86,61 @@ func (a *App) GetSettings(c echo.Context) error {
 	s.BounceLettermint.Key = strings.Repeat(pwdMask, utf8.RuneCountInString(s.BounceLettermint.Key))
 	s.SecurityCaptcha.HCaptcha.Secret = strings.Repeat(pwdMask, utf8.RuneCountInString(s.SecurityCaptcha.HCaptcha.Secret))
 	s.OIDC.ClientSecret = strings.Repeat(pwdMask, utf8.RuneCountInString(s.OIDC.ClientSecret))
+}
 
-	return c.JSON(http.StatusOK, okResp{s})
+// roleOption is a minimal role representation for the settings OIDC role dropdowns.
+type roleOption struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+// settingsView is the admin page view for the settings form.
+type settingsView struct {
+	adminView
+
+	Settings  models.Settings
+	UserRoles []roleOption
+	ListRoles []roleOption
+	Version   string
+}
+
+// ViewSettings renders the HTML view for the settings form.
+func (a *App) ViewSettings(c echo.Context) error {
+	s, err := a.core.GetSettings()
+	if err != nil {
+		return err
+	}
+	maskSettings(&s)
+
+	// Roles for the OIDC default-role dropdowns (security tab).
+	var userRoles, listRoles []roleOption
+	if can(auth.GetUser(c), auth.PermRolesGet) {
+		ur, err := a.core.GetRoles("", "", "")
+		if err != nil {
+			return err
+		}
+		for _, r := range ur {
+			userRoles = append(userRoles, roleOption{ID: r.ID, Name: r.Name.String})
+		}
+
+		lr, err := a.core.GetListRoles("", "", "")
+		if err != nil {
+			return err
+		}
+		for _, r := range lr {
+			listRoles = append(listRoles, roleOption{ID: r.ID, Name: r.Name.String})
+		}
+	}
+
+	data := settingsView{
+		adminView: newAdminView(c, a.i18n.T("settings.title"), "", "settings.all"),
+		Settings:  s,
+		UserRoles: userRoles,
+		ListRoles: listRoles,
+		Version:   versionString,
+	}
+
+	return c.Render(http.StatusOK, "admin-settings", data)
 }
 
 // UpdateSettings returns settings from the DB.
@@ -96,6 +155,12 @@ func (a *App) UpdateSettings(c echo.Context) error {
 	cur, err := a.core.GetSettings()
 	if err != nil {
 		return err
+	}
+
+	// Preserve the OIDC role mapping when older clients do not send the field.
+	// An explicit empty array still clears the mapping.
+	if set.OIDC.Roles == nil {
+		set.OIDC.Roles = cur.OIDC.Roles
 	}
 
 	// Validate and sanitize postback Messenger names along with SMTP names
@@ -254,12 +319,8 @@ func (a *App) UpdateSettings(c echo.Context) error {
 		set.OIDC.ClientSecret = cur.OIDC.ClientSecret
 	}
 
-	// OIDC user auto-creation is enabled. Validate.
-	if set.OIDC.AutoCreateUsers {
-		if set.OIDC.DefaultUserRoleID.Int < auth.SuperAdminRoleID {
-			return echo.NewHTTPError(http.StatusBadRequest,
-				a.i18n.Ts("globals.messages.invalidFields", "name", a.i18n.T("settings.security.OIDCDefaultRole")))
-		}
+	if err := a.validateOIDCSettings(set); err != nil {
+		return err
 	}
 
 	for n, v := range set.UploadExtensions {
@@ -305,7 +366,7 @@ func (a *App) UpdateSettings(c echo.Context) error {
 
 	// Validate slow query caching cron.
 	if set.CacheSlowQueries {
-		if _, err := cron.ParseStandard(set.CacheSlowQueriesInterval); err != nil {
+		if _, err := parseCronString(set.CacheSlowQueriesInterval); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, a.i18n.Ts("globals.messages.invalidData")+": slow query cron: "+err.Error())
 		}
 	}
@@ -331,12 +392,40 @@ func (a *App) UpdateSettingsByKey(c echo.Context) error {
 		return err
 	}
 
+	// Validate OIDC defaults and mappings on both settings endpoints.
+	if key == "security.oidc" {
+		var set models.Settings
+		if err := json.Unmarshal(b, &set.OIDC); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("globals.messages.invalidData"))
+		}
+
+		if err := a.validateOIDCSettings(set); err != nil {
+			return err
+		}
+	}
+
 	// Update the value in the DB.
 	if err := a.core.UpdateSettingsByKey(key, b); err != nil {
 		return err
 	}
 
 	return a.handleSettingsRestart(c)
+}
+
+// validateOIDCSettings validates default roles and claim mapping.
+func (a *App) validateOIDCSettings(set models.Settings) error {
+	userRoles, err := a.core.GetRoles("", "", "")
+	if err != nil {
+		return err
+	}
+	listRoles, err := a.core.GetListRoles("", "", "")
+	if err != nil {
+		return err
+	}
+	if err := validateOIDCSettings(set, userRoles, listRoles); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	return nil
 }
 
 // handleSettingsRestart checks for running campaigns and either triggers an
@@ -361,6 +450,23 @@ func (a *App) handleSettingsRestart(c echo.Context) error {
 	}()
 
 	return c.JSON(http.StatusOK, okResp{true})
+}
+
+// logsView is the admin page view for the log viewer.
+type logsView struct {
+	adminView
+
+	Lines []string
+}
+
+// ViewLogs renders the HTML view for the application log viewer.
+func (a *App) ViewLogs(c echo.Context) error {
+	data := logsView{
+		adminView: newAdminView(c, a.i18n.T("logs.title"), "", "settings.logs"),
+		Lines:     a.bufLog.Lines(),
+	}
+
+	return c.Render(http.StatusOK, "admin-logs", data)
 }
 
 // GetLogs returns the log entries stored in the log buffer.

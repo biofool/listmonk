@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/md5"
 	"database/sql"
 	"encoding/json"
@@ -12,7 +13,9 @@ import (
 	"log"
 	"log/slog"
 	"maps"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -54,6 +57,8 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
 	flag "github.com/spf13/pflag"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 	"gopkg.in/volatiletech/null.v6"
 )
 
@@ -67,6 +72,7 @@ const (
 // UrlConfig contains various URL constants used in the app.
 type UrlConfig struct {
 	RootURL      string `koanf:"root_url"`
+	RootPath     string
 	LogoURL      string `koanf:"logo_url"`
 	FaviconURL   string `koanf:"favicon_url"`
 	LoginURL     string `koanf:"login_url"`
@@ -104,14 +110,15 @@ type Config struct {
 	} `koanf:"privacy"`
 	Security struct {
 		OIDC struct {
-			Enabled           bool   `koanf:"enabled"`
-			ProviderURL       string `koanf:"provider_url"`
-			ProviderName      string `koanf:"provider_name"`
-			ClientID          string `koanf:"client_id"`
-			ClientSecret      string `koanf:"client_secret"`
-			AutoCreateUsers   bool   `koanf:"auto_create_users"`
-			DefaultUserRoleID int    `koanf:"default_user_role_id"`
-			DefaultListRoleID int    `koanf:"default_list_role_id"`
+			Enabled           bool                     `koanf:"enabled"`
+			ProviderURL       string                   `koanf:"provider_url"`
+			ProviderName      string                   `koanf:"provider_name"`
+			ClientID          string                   `koanf:"client_id"`
+			ClientSecret      string                   `koanf:"client_secret"`
+			AutoCreateUsers   bool                     `koanf:"auto_create_users"`
+			DefaultUserRoleID int                      `koanf:"default_user_role_id"`
+			DefaultListRoleID int                      `koanf:"default_list_role_id"`
+			Roles             []models.OIDCRoleMapping `koanf:"roles"`
 		} `koanf:"oidc"`
 
 		Captcha struct {
@@ -137,7 +144,9 @@ type Config struct {
 	}
 
 	HasLegacyUser bool
-	AssetVersion  string
+
+	AssetVersion       string
+	CustomAssetVersion string
 
 	MediaUpload struct {
 		Provider   string
@@ -154,6 +163,9 @@ type Config struct {
 
 	PermissionsRaw json.RawMessage
 	Permissions    map[string]struct{}
+
+	// i18n keys (from i18n.txt) printed in admin HTML pages for JS to use.
+	AdminI18nKeys []string
 }
 
 // initFlags initializes the commandline flags into the Koanf instance.
@@ -201,7 +213,7 @@ func initConfigFiles(files []string, ko *koanf.Koanf) {
 
 // initFileSystem initializes the stuffbin FileSystem to provide
 // access to bundled static assets to the app.
-func initFS(appDir, frontendDir, staticDir, i18nDir string) stuffbin.FileSystem {
+func initFS(appDir, staticDir, i18nDir string) stuffbin.FileSystem {
 	var (
 		// stuffbin real_path:virtual_alias paths to map local assets on disk
 		// when there an embedded filestystem is not found.
@@ -214,14 +226,15 @@ func initFS(appDir, frontendDir, staticDir, i18nDir string) stuffbin.FileSystem 
 			"./permissions.json:permissions.json",
 		}
 
-		frontendFiles = []string{
-			// Admin frontend's static assets accessible at /admin/* during runtime.
-			// These paths are sourced from frontendDir.
-			"./:/admin",
-		}
-
 		staticFiles = []string{
-			// These paths are joined with staticDir.
+			// These paths are joined with staticDir. The SSR admin frontend is split:
+			// the Go HTML templates (views/, partials/) are parsed from source, while
+			// the JS/CSS/asset bundle is built into admin/dist (see static/admin/build.mjs)
+			// and served at /admin/static.
+			"./admin/views:/admin/views",
+			"./admin/partials:/admin/partials",
+			"./admin/dist:/admin/static",
+			"./admin/i18n.txt:/admin/i18n.txt",
 			"./email-templates:static/email-templates",
 			"./public:/public",
 		}
@@ -254,11 +267,10 @@ func initFS(appDir, frontendDir, staticDir, i18nDir string) stuffbin.FileSystem 
 		}
 	}
 
-	// If the embed failed, load app and frontend files from the compile-time paths.
+	// If the embed failed, load app files from the compile-time paths.
 	files := []string{}
 	if !hasEmbed {
 		files = append(files, joinFSPaths(appDir, appFiles)...)
-		files = append(files, joinFSPaths(frontendDir, frontendFiles)...)
 	}
 
 	// Irrespective of the embeds, if there are user specified static or i18n paths,
@@ -459,8 +471,16 @@ func initSettings(query string, db *sqlx.DB, ko *koanf.Koanf) {
 func initUrlConfig(ko *koanf.Koanf) *UrlConfig {
 	root := strings.TrimSuffix(ko.String("app.root_url"), "/")
 
+	// rootPath is the path component of the root URL set in config.
+	// It's used as the base path for all admin/static asset URLs.
+	var rootPath string
+	if u, err := url.Parse(root); err == nil {
+		rootPath = "/" + strings.TrimSuffix(u.Path, "/")
+	}
+
 	return &UrlConfig{
 		RootURL:    root,
+		RootPath:   rootPath,
 		LogoURL:    ko.String("app.logo_url"),
 		FaviconURL: ko.String("app.favicon_url"),
 		LoginURL:   path.Join(uriAdmin, "/login"),
@@ -520,8 +540,13 @@ func initConstConfig(ko *koanf.Koanf) *Config {
 	c.BounceLettermintEnabled = ko.Bool("bounce.lettermint.enabled")
 	c.HasLegacyUser = ko.Exists("app.admin_username") || ko.Exists("app.admin_password")
 
-	b := md5.Sum([]byte(time.Now().String()))
-	c.AssetVersion = fmt.Sprintf("%x", b)[0:10]
+	// Fixed during build time so that it doesn't change across restarts.
+	av := md5.Sum([]byte(buildString))
+	c.AssetVersion = fmt.Sprintf("%x", av)[0:10]
+
+	// Changes on every restart (specifically for admin-controlled custom.js|css endpoints).
+	cv := md5.Sum([]byte(time.Now().String()))
+	c.CustomAssetVersion = fmt.Sprintf("%x", cv)[0:10]
 
 	pm, err := fs.Read("/permissions.json")
 	if err != nil {
@@ -543,6 +568,20 @@ func initConstConfig(ko *koanf.Koanf) *Config {
 		for _, g := range group.Permissions {
 			c.Permissions[g] = struct{}{}
 		}
+	}
+
+	// Load the list of i18n keys exported to the SSR admin frontend for JS.
+	keys, err := fs.Read("/admin/i18n.txt")
+	if err != nil {
+		lo.Fatalf("error reading admin i18n keys file: %v", err)
+	}
+
+	for line := range strings.SplitSeq(string(keys), "\n") {
+		if line = strings.TrimSpace(line); line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		c.AdminI18nKeys = append(c.AdminI18nKeys, line)
 	}
 
 	return &c
@@ -627,7 +666,7 @@ func initCampaignManager(msgrs []manager.Messenger, q *models.Queries, u *UrlCon
 
 // initTxTemplates initializes and compiles the transactional templates and caches them in-memory.
 func initTxTemplates(m *manager.Manager, co *core.Core) {
-	tpls, err := co.GetTemplates(models.TemplateTypeTx, false)
+	tpls, err := co.GetTemplates("", models.TemplateTypeTx, false, "", "")
 	if err != nil {
 		lo.Fatalf("error loading transactional templates: %v", err)
 	}
@@ -933,33 +972,66 @@ func initHTTPServer(cfg *Config, urlCfg *UrlConfig, i *i18n.I18n, fs stuffbin.Fi
 	srv.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			c.Set("app", app)
+
+			// Used for computing a request's finish time.
+			c.Set("start_time", time.Now())
 			return next(c)
 		}
 	})
 
-	tpl, err := stuffbin.ParseTemplatesGlob(initTplFuncs(i, urlCfg), fs, "/public/templates/*.html")
+	tplFuncs := initTplFuncs(i, urlCfg)
+	pubTpl, err := stuffbin.ParseTemplatesGlob(tplFuncs, fs, "/public/templates/*.html")
 	if err != nil {
 		lo.Fatalf("error parsing public templates: %v", err)
 	}
-	srv.Renderer = &tplRenderer{
-		templates:           tpl,
-		SiteName:            cfg.SiteName,
-		RootURL:             urlCfg.RootURL,
-		LogoURL:             urlCfg.LogoURL,
-		FaviconURL:          urlCfg.FaviconURL,
-		AssetVersion:        cfg.AssetVersion,
-		EnablePublicSubPage: cfg.EnablePublicSubPage,
-		EnablePublicArchive: cfg.EnablePublicArchive,
-		IndividualTracking:  cfg.Privacy.IndividualTracking,
+
+	// Admin templates live in /admin/views and /admin/partials, plus nested
+	// module partials like /admin/partials/settings. Glob both levels and parse
+	// them into a single template set (all files use {{ define }} blocks).
+	adminPaths, err := fs.Glob("/admin/*/*.html")
+	if err != nil {
+		lo.Fatalf("error globbing admin templates: %v", err)
+	}
+	nestedPaths, err := fs.Glob("/admin/partials/*/*.html")
+	if err != nil {
+		lo.Fatalf("error globbing nested admin templates: %v", err)
+	}
+	adminTpl, err := stuffbin.ParseTemplates(tplFuncs, fs, append(adminPaths, nestedPaths...)...)
+	if err != nil {
+		lo.Fatalf("error parsing admin templates: %v", err)
+	}
+	srv.Renderer = &appTplRenderer{
+		PubRenderer: &pubTplRenderer{
+			templates:           pubTpl,
+			SiteName:            cfg.SiteName,
+			RootURL:             urlCfg.RootURL,
+			LogoURL:             urlCfg.LogoURL,
+			FaviconURL:          urlCfg.FaviconURL,
+			AssetVersion:        cfg.AssetVersion,
+			CustomAssetVersion:  cfg.CustomAssetVersion,
+			EnablePublicSubPage: cfg.EnablePublicSubPage,
+			EnablePublicArchive: cfg.EnablePublicArchive,
+			IndividualTracking:  cfg.Privacy.IndividualTracking,
+		},
+		AdminRenderer: &adminTplRenderer{
+			templates:          adminTpl,
+			SiteName:           cfg.SiteName,
+			RootURL:            urlCfg.RootURL,
+			LogoURL:            urlCfg.LogoURL,
+			FaviconURL:         urlCfg.FaviconURL,
+			AssetVersion:       cfg.AssetVersion,
+			CustomAssetVersion: cfg.CustomAssetVersion,
+			Lang:               cfg.Lang,
+		},
 	}
 
 	// Initialize the static file server.
-	fSrv := fs.FileServer()
+	fSrv := staticServer(fs)
 
 	// Public (subscriber) facing static files.
 	srv.GET("/public/static/*", echo.WrapHandler(fSrv))
 
-	// Admin (frontend) facing static files.
+	// Admin (frontend) facing static files (SSR admin JS/CSS/asset bundle).
 	srv.GET("/admin/static/*", echo.WrapHandler(fSrv))
 
 	// Public (subscriber) facing media upload files.
@@ -992,6 +1064,67 @@ func initHTTPServer(cfg *Config, urlCfg *UrlConfig, i *i18n.I18n, fs stuffbin.Fi
 	return srv
 }
 
+// staticServer returns an http.Handler that serves static files from the stuffbin
+// FS, preferring precompressed .gz variants.
+func staticServer(fs stuffbin.FileSystem) http.Handler {
+	fSrv := fs.FileServer()
+
+	// Set long cache headers. New dists have `?v=.AssetVersion` param that changes,
+	// so that'll bust cache.
+	const cacheControl = "public, max-age=31536000, immutable"
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", cacheControl)
+
+		// Is there a .gz version?
+		f, err := fs.Get(r.URL.Path + ".gz")
+		if err != nil {
+			// No, server the file as-is.
+			fSrv.ServeHTTP(w, r)
+			return
+		}
+
+		// Yep, there is.
+		info, err := f.Stat()
+		if err != nil {
+			fSrv.ServeHTTP(w, r)
+			return
+		}
+
+		// Strip .gz and get the content type.
+		hdr := w.Header()
+		if ctype := mime.TypeByExtension(path.Ext(r.URL.Path)); ctype != "" {
+			hdr.Set("Content-Type", ctype)
+		}
+		hdr.Set("Vary", "Accept-Encoding")
+
+		// Client accepts gzip. Serve bytes as is.
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			hdr.Set("Content-Encoding", "gzip")
+			http.ServeContent(w, r, r.URL.Path, info.ModTime(), f)
+			return
+		}
+
+		// Client doesn't accept gzip, decompress on the fly and serve the result.
+		// This isn't ideal for performance, but rarely will a modern client not
+		// support gzip.
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			http.Error(w, "error reading static asset", http.StatusInternalServerError)
+			return
+		}
+		defer gz.Close()
+
+		b, err := io.ReadAll(gz)
+		if err != nil {
+			http.Error(w, "error decompressing static asset", http.StatusInternalServerError)
+			return
+		}
+
+		http.ServeContent(w, r, r.URL.Path, info.ModTime(), bytes.NewReader(b))
+	})
+}
+
 // initCaptcha initializes the captcha service.
 func initCaptcha() *captcha.Captcha {
 	var opt captcha.Opt
@@ -1012,15 +1145,18 @@ func initCron(co *core.Core, db *sqlx.DB) {
 		if intval == "" {
 			lo.Println("error: invalid cron interval string for slow query cache")
 		} else {
-			_, err := c.Add(intval, func() {
-				lo.Println("refreshing slow query cache")
-				_ = co.RefreshMatViews(true)
-				lo.Println("done refreshing slow query cache")
-			})
+			schedule, err := parseCronString(intval)
+			if err == nil {
+				_, err = c.Schedule(schedule, func() {
+					lo.Println("refreshing slow query cache")
+					_ = co.RefreshMatViews(true)
+					lo.Println("done refreshing slow query cache")
+				})
+			}
 			if err != nil {
 				lo.Printf("error initializing slow cache query cron: %v", err)
 			} else {
-				lo.Printf("IMPORTANT: database slow query caching is enabled. Aggregate numbers and stats will not be realtime. Next refresh at: %v", c.Entries()[len(c.Entries())-1].Next)
+				lo.Printf("IMPORTANT: database slow query caching is enabled. Aggregate numbers and stats will not be realtime. Next refresh at: %v", schedule.Next(time.Now()))
 			}
 		}
 	}
@@ -1031,9 +1167,12 @@ func initCron(co *core.Core, db *sqlx.DB) {
 		if intval == "" {
 			lo.Println("error: invalid cron interval string for database vacuum")
 		} else {
-			_, err := c.Add(intval, func() {
-				RunDBVacuum(db, lo)
-			})
+			schedule, err := parseCronString(intval)
+			if err == nil {
+				_, err = c.Schedule(schedule, func() {
+					RunDBVacuum(db, lo)
+				})
+			}
 			if err != nil {
 				lo.Printf("error initializing database vacuum cron: %v", err)
 			} else {
@@ -1087,6 +1226,18 @@ func initTplFuncs(i *i18n.I18n, u *UrlConfig) template.FuncMap {
 		"RootURL": func() string {
 			return u.RootURL
 		},
+		// URI prefixes an absolute app path with the root path (if any) so that
+		// server-rendered links/assets resolve correctly when the app is hosted
+		// under a sub-path. It's a no-op for a root-level install.
+		"URI": func(p string) string {
+			out, err := url.JoinPath(u.RootPath, p)
+			if err != nil {
+				lo.Printf("error joining path %s with root path %s: %v", p, u.RootPath, err)
+				return u.RootPath + p
+			}
+
+			return out
+		},
 		"LogoURL": func() string {
 			return u.LogoURL
 		},
@@ -1101,6 +1252,86 @@ func initTplFuncs(i *i18n.I18n, u *UrlConfig) template.FuncMap {
 		},
 		"Safe": func(safeHTML string) template.HTML {
 			return template.HTML(safeHTML)
+		},
+		"Icon": func(name string, file ...string) template.HTML {
+			f := "icons.svg"
+			if len(file) > 0 && file[0] != "" {
+				// Optional filename.
+				f = file[0]
+			}
+
+			name = template.HTMLEscapeString(name)
+			return template.HTML(fmt.Sprintf(`<svg class="icon"><use href="%sadmin/static/%s#icon-%s"></use></svg>`, u.RootPath, f, name))
+		},
+		// Auto-generated colour gradient CSS avatar.
+		"Initials": makeInitials,
+		// '●' that is printed inside some badges.
+		"Dot": func() template.HTML {
+			return template.HTML(`<span class="dot">&#9679;</span>`)
+		},
+		// First param = content
+		// Second param = optional classes separated by string, eg: "outline status-finished".
+		// Third param = optional data-variant, eg: "success".
+		"Badge": func(content any, opts ...string) template.HTML {
+			class := "badge"
+			if len(opts) > 0 {
+				if s := strings.TrimSpace(opts[0]); s != "" {
+					class += " " + s
+				}
+			}
+
+			attrs := fmt.Sprintf(`class="%s"`, template.HTMLEscapeString(class))
+			if len(opts) > 1 {
+				if v := strings.TrimSpace(opts[1]); v != "" {
+					attrs += fmt.Sprintf(` data-variant="%s"`, template.HTMLEscapeString(v))
+				}
+			}
+
+			return template.HTML(fmt.Sprintf(`<span %s>%s</span>`, attrs, badgeContent(content)))
+		},
+		"IsNav": func(current, id string) template.HTMLAttr {
+			if current == id {
+				return template.HTMLAttr(` aria-current="page"`)
+			}
+			return ""
+		},
+		"ExpandNav": func(current, section string) template.HTMLAttr {
+			if current == section || strings.HasPrefix(current, section+".") {
+				return template.HTMLAttr(" open")
+			}
+			return ""
+		},
+		"ToJSON":        jsonForTpl,
+		"Can":           can,
+		"CanManageList": canManageList,
+		"FormatNumber": func(n int) string {
+			p := message.NewPrinter(language.English)
+			return p.Sprintf("%d", n)
+		},
+		"NiceDate": func(t any, withTime ...bool) string {
+			layout := "Mon, 02 Jan 2006"
+			if len(withTime) > 0 && withTime[0] {
+				layout += ", 15:04"
+			}
+
+			return niceDate(t, layout)
+		},
+		"Duration": func(from, to any) string {
+			f, ok := toTime(from)
+			if !ok {
+				return ""
+			}
+			t, ok := toTime(to)
+			if !ok {
+				return ""
+			}
+
+			d := t.Sub(f)
+			if d <= 0 {
+				return ""
+			}
+
+			return niceDuration(d)
 		},
 	}
 
@@ -1233,4 +1464,62 @@ func parseTextTemplatesGlob(f txttpl.FuncMap, fs stuffbin.FileSystem, pattern st
 	}
 
 	return tpl, nil
+}
+
+// niceDate formats the given date for template rendering.
+// toTime extracts a non-zero time.Time out of a time.Time or null.Time value.
+func toTime(t any) (time.Time, bool) {
+	switch v := t.(type) {
+	case time.Time:
+		return v, !v.IsZero()
+	case null.Time:
+		return v.Time, v.Valid
+	}
+
+	return time.Time{}, false
+}
+
+func niceDate(t any, layout string) string {
+	switch v := t.(type) {
+	case time.Time:
+		if v.IsZero() {
+			return ""
+		}
+		return v.Format(layout)
+	case null.Time:
+		if !v.Valid {
+			return ""
+		}
+		return v.Time.Format(layout)
+	}
+
+	return ""
+}
+
+// badgeContent renders the content of a badge. Pre-rendered markup (eg: Icon())
+// goes in as-is and everything else is escaped.
+func badgeContent(content any) template.HTML {
+	switch v := content.(type) {
+	case template.HTML:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, c := range v {
+			if s := string(badgeContent(c)); s != "" {
+				out = append(out, s)
+			}
+		}
+		return template.HTML(strings.Join(out, " "))
+	}
+
+	return template.HTML(template.HTMLEscapeString(fmt.Sprint(content)))
+}
+
+// parseCronString parses a standard cron expression.
+func parseCronString(spec string) (cron.Schedule, error) {
+	p, err := cron.NewDefaultParser(cron.StandardOptions)
+	if err != nil {
+		return nil, err
+	}
+	return p.Parse(spec)
 }

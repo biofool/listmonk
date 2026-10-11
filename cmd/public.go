@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"image"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/knadh/listmonk/internal/captcha"
 	"github.com/knadh/listmonk/internal/i18n"
@@ -25,17 +27,36 @@ const (
 	tplMessage = "message"
 )
 
-// tplRenderer wraps a template.tplRenderer for echo.
-type tplRenderer struct {
+// pubTplRenderer wraps public templates for echo.
+type pubTplRenderer struct {
 	templates           *template.Template
 	SiteName            string
 	RootURL             string
 	LogoURL             string
 	FaviconURL          string
 	AssetVersion        string
+	CustomAssetVersion  string
 	EnablePublicSubPage bool
 	EnablePublicArchive bool
 	IndividualTracking  bool
+}
+
+// adminTplRenderer wraps admin templates for echo.
+type adminTplRenderer struct {
+	templates          *template.Template
+	SiteName           string
+	RootURL            string
+	LogoURL            string
+	FaviconURL         string
+	AssetVersion       string
+	CustomAssetVersion string
+	Lang               string
+}
+
+// appTplRenderer dispatches c.Render() calls to the appropriate template set.
+type appTplRenderer struct {
+	PubRenderer   *pubTplRenderer
+	AdminRenderer *adminTplRenderer
 }
 
 // tplData is the data container that is injected
@@ -46,11 +67,28 @@ type tplData struct {
 	LogoURL             string
 	FaviconURL          string
 	AssetVersion        string
+	CustomAssetVersion  string
 	EnablePublicSubPage bool
 	EnablePublicArchive bool
 	IndividualTracking  bool
 	Data                any
 	L                   *i18n.I18n
+}
+
+// adminTplData is the data container injected into admin templates.
+type adminTplData struct {
+	SiteName           string
+	RootURL            string
+	LogoURL            string
+	FaviconURL         string
+	AssetVersion       string
+	CustomAssetVersion string
+	Lang               string
+	ConfigJS           serverConfig
+	I18nJS             json.RawMessage
+	ReqDuration        string
+	Data               any
+	L                  *i18n.I18n
 }
 
 type publicTpl struct {
@@ -105,19 +143,64 @@ var (
 )
 
 // Render executes and renders a template for echo.
-func (t *tplRenderer) Render(w io.Writer, name string, data any, c echo.Context) error {
+func (t *pubTplRenderer) Render(w io.Writer, name string, data any, c echo.Context) error {
 	return t.templates.ExecuteTemplate(w, name, tplData{
 		SiteName:            t.SiteName,
 		RootURL:             t.RootURL,
 		LogoURL:             t.LogoURL,
 		FaviconURL:          t.FaviconURL,
 		AssetVersion:        t.AssetVersion,
+		CustomAssetVersion:  t.CustomAssetVersion,
 		EnablePublicSubPage: t.EnablePublicSubPage,
 		EnablePublicArchive: t.EnablePublicArchive,
 		IndividualTracking:  t.IndividualTracking,
 		Data:                data,
 		L:                   c.Get("app").(*App).i18n,
 	})
+}
+
+// Render executes and renders an admin template for echo.
+func (t *adminTplRenderer) Render(w io.Writer, name string, data any, c echo.Context) error {
+	app := c.Get("app").(*App)
+	configJS, err := app.makeServerConfig()
+	if err != nil {
+		return err
+	}
+
+	// Compute request duration.
+	var reqDuration string
+	if start, ok := c.Get("start_time").(time.Time); ok {
+		reqDuration = time.Since(start).Round(time.Microsecond).String()
+	}
+
+	return t.templates.ExecuteTemplate(w, name, adminTplData{
+		SiteName:           t.SiteName,
+		RootURL:            t.RootURL,
+		LogoURL:            t.LogoURL,
+		FaviconURL:         t.FaviconURL,
+		AssetVersion:       t.AssetVersion,
+		CustomAssetVersion: t.CustomAssetVersion,
+		Lang:               t.Lang,
+		ConfigJS:           configJS,
+		I18nJS:             app.adminI18nJS,
+		ReqDuration:        reqDuration,
+		Data:               data,
+		L:                  app.i18n,
+	})
+}
+
+// Render routes template execution to admin or public templates.
+func (t *appTplRenderer) Render(w io.Writer, name string, data any, c echo.Context) error {
+	if t.AdminRenderer != nil && t.AdminRenderer.templates.Lookup(name) != nil {
+		return t.AdminRenderer.Render(w, name, data, c)
+	}
+
+	return t.PubRenderer.Render(w, name, data, c)
+}
+
+func jsonForTpl(v any) template.JS {
+	b, _ := json.Marshal(v)
+	return template.JS(b)
 }
 
 // GetPublicLists returns the list of public lists with minimal fields
@@ -275,17 +358,7 @@ func (a *App) SubscriptionPrefs(c echo.Context) error {
 		blocklist = a.cfg.Privacy.AllowBlocklist && req.Blocklist
 	)
 	if !req.Manage || blocklist {
-		var err error
-		if blocklist || campUUID != dummyUUID {
-			err = a.core.UnsubscribeByCampaign(subUUID, campUUID, blocklist)
-		} else {
-			// Opt-in confirmation e-mails carry a placeholder campaign UUID in
-			// the List-Unsubscribe URL as there is no campaign. A one-click
-			// unsubscribe on it cancels the subscriber's pending (unconfirmed)
-			// subscriptions.
-			err = a.core.UnsubscribeUnconfirmed(subUUID)
-		}
-		if err != nil {
+		if err := a.core.UnsubscribeByCampaign(subUUID, campUUID, blocklist, campUUID == dummyUUID); err != nil {
 			return c.Render(http.StatusInternalServerError, tplMessage,
 				makeMsgTpl(a.i18n.T("public.errorTitle"), "", a.i18n.T("public.errorProcessingRequest")))
 		}

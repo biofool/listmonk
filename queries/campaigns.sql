@@ -73,14 +73,15 @@ FROM campaigns c
 WHERE ($1 = 0 OR id = $1)
     AND (CARDINALITY($2::campaign_status[]) = 0 OR status = ANY($2))
     AND (CARDINALITY($3::VARCHAR(100)[]) = 0 OR $3 <@ tags)
-    AND ($4 = '' OR TO_TSVECTOR(CONCAT(name, ' ', subject)) @@ TO_TSQUERY($4) OR CONCAT(c.name, ' ', c.subject) ILIKE $4)
+    AND ($4 = '' OR TO_TSVECTOR(CONCAT(name, ' ', subject)) @@ PLAINTO_TSQUERY($4) OR CONCAT(c.name, ' ', c.subject) ILIKE ('%' || $4 || '%'))
+    AND ($5 = '' OR type = $5::campaign_type)
     -- Get all campaigns or filter by list IDs.
     AND (
-        $5 OR EXISTS (
-            SELECT 1 FROM campaign_lists WHERE campaign_id = c.id AND list_id = ANY($6::INT[])
+        $6 OR EXISTS (
+            SELECT 1 FROM campaign_lists WHERE campaign_id = c.id AND list_id = ANY($7::INT[])
         )
     )
-ORDER BY %order% OFFSET $7 LIMIT (CASE WHEN $8 < 1 THEN NULL ELSE $8 END);
+ORDER BY %order% OFFSET $8 LIMIT (CASE WHEN $9 < 1 THEN NULL ELSE $9 END);
 
 -- name: get-campaign
 SELECT campaigns.*,
@@ -105,7 +106,7 @@ SELECT COUNT(*) OVER () AS total, campaigns.*,
         ELSE templates.id = campaigns.archive_template_id END
     )
     WHERE campaigns.archive=true AND campaigns.type='regular' AND campaigns.status=ANY('{running, paused, finished}')
-    ORDER by campaigns.created_at DESC OFFSET $1 LIMIT $2;
+    ORDER by campaigns.started_at DESC NULLS LAST, campaigns.id DESC OFFSET $1 LIMIT $2;
 
 -- name: get-campaign-stats
 -- This query is used to lazy load campaign stats (views, counts, list of lists) given a list of campaign IDs.
@@ -232,12 +233,8 @@ u AS (
 SELECT camps.*, campMedia.media_id FROM camps LEFT JOIN campMedia ON (campMedia.campaign_id = camps.id);
 
 -- name: get-campaign-analytics-unique-counts
-WITH intval AS (
-    -- For intervals < a week, aggregate counts hourly, otherwise daily.
-    SELECT CASE WHEN (EXTRACT (EPOCH FROM ($3::TIMESTAMP - $2::TIMESTAMP)) / 86400) >= 7 THEN 'day' ELSE 'hour' END
-),
-uniqIDs AS (
-    SELECT DISTINCT ON(subscriber_id, campaign_id) subscriber_id, campaign_id, DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
+WITH uniqIDs AS (
+    SELECT DISTINCT ON(subscriber_id, campaign_id) subscriber_id, campaign_id, DATE_TRUNC($4::TEXT, created_at) AS "timestamp"
     FROM %s
     WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
     ORDER BY subscriber_id, campaign_id, "timestamp"
@@ -247,21 +244,13 @@ SELECT COUNT(*) AS "count", campaign_id, "timestamp"
 
 -- name: get-campaign-analytics-counts
 -- raw: true
-WITH intval AS (
-    -- For intervals < a week, aggregate counts hourly, otherwise daily.
-    SELECT CASE WHEN (EXTRACT (EPOCH FROM ($3::TIMESTAMP - $2::TIMESTAMP)) / 86400) >= 7 THEN 'day' ELSE 'hour' END
-)
-SELECT campaign_id, COUNT(*) AS "count", DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
+SELECT campaign_id, COUNT(*) AS "count", DATE_TRUNC($4::TEXT, created_at) AS "timestamp"
     FROM %s
     WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
     GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
 
 -- name: get-campaign-bounce-counts
-WITH intval AS (
-    -- For intervals < a week, aggregate counts hourly, otherwise daily.
-    SELECT CASE WHEN (EXTRACT (EPOCH FROM ($3::TIMESTAMP - $2::TIMESTAMP)) / 86400) >= 7 THEN 'day' ELSE 'hour' END
-)
-SELECT campaign_id, COUNT(*) AS "count", DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
+SELECT campaign_id, COUNT(*) AS "count", DATE_TRUNC($4::TEXT, created_at) AS "timestamp"
     FROM bounces
     WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
     GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
@@ -468,7 +457,10 @@ DELETE FROM campaigns c
 WHERE (
     CASE
         WHEN CARDINALITY($1::INT[]) > 0 THEN id = ANY($1)
-        ELSE $2 = '' OR TO_TSVECTOR(CONCAT(name, ' ', subject)) @@ TO_TSQUERY($2) OR CONCAT(c.name, ' ', c.subject) ILIKE $2
+        ELSE ($2 = '' OR TO_TSVECTOR(CONCAT(name, ' ', subject)) @@ PLAINTO_TSQUERY($2) OR CONCAT(c.name, ' ', c.subject) ILIKE ('%' || $2 || '%'))
+            AND (COALESCE(CARDINALITY($5::campaign_status[]), 0) = 0 OR status = ANY($5))
+            AND (COALESCE(CARDINALITY($6::VARCHAR(100)[]), 0) = 0 OR $6 <@ tags)
+            AND ($7 = '' OR type = $7::campaign_type)
     END
 )
 -- Get all campaigns or filter by permitted list IDs.
@@ -486,4 +478,3 @@ WITH view AS (
 )
 INSERT INTO campaign_views (campaign_id, subscriber_id)
     VALUES((SELECT campaign_id FROM view), (SELECT subscriber_id FROM view));
-

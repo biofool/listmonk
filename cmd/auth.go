@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -196,8 +197,35 @@ func (a *App) OIDCLogin(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, a.i18n.T("globals.messages.internalError"))
 	}
 
+	authURL, codeVerifier := a.auth.GetOIDCAuthURL(base64.URLEncoding.EncodeToString(b), nonce.Value)
+
+	if authURL == "" {
+		return echo.NewHTTPError(http.StatusInternalServerError, a.i18n.T("globals.messages.internalError"))
+	}
+
+	// Store the verifier for the callback, or clear a stale cookie if PKCE is disabled.
+	a.setOIDCVerifierCookie(c, codeVerifier)
+
 	// Redirect to the external OIDC provider.
-	return c.Redirect(http.StatusFound, a.auth.GetOIDCAuthURL(base64.URLEncoding.EncodeToString(b), nonce.Value))
+	return c.Redirect(http.StatusFound, authURL)
+}
+
+// setOIDCVerifierCookie stores the PKCE verifier or deletes it if it's empty.
+func (a *App) setOIDCVerifierCookie(c echo.Context, verifier string) {
+	ck := &http.Cookie{
+		Name:     "oidc_code_verifier",
+		Value:    verifier,
+		HttpOnly: true,
+		Secure:   strings.HasPrefix(a.urlCfg.RootURL, "https://"),
+		Path:     "/",
+		SameSite: http.SameSiteLaxMode,
+	}
+
+	if verifier == "" {
+		ck.MaxAge = -1
+	}
+
+	c.SetCookie(ck)
 }
 
 // OIDCFinish receives the redirect callback from the OIDC provider and completes the handshake.
@@ -208,8 +236,15 @@ func (a *App) OIDCFinish(c echo.Context) error {
 		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusUnauthorized, a.i18n.T("users.invalidRequest")))
 	}
 
+	// Get the PKCE code verifier set on the login request, if any, and clear it as it's single-use.
+	codeVerifier := ""
+	if ck, err := c.Cookie("oidc_code_verifier"); err == nil {
+		codeVerifier = ck.Value
+		a.setOIDCVerifierCookie(c, "")
+	}
+
 	// Validate the OIDC token.
-	oidcToken, claims, err := a.auth.ExchangeOIDCToken(c.Request().URL.Query().Get("code"), nonce.Value)
+	oidcToken, claims, err := a.auth.ExchangeOIDCToken(c.Request().URL.Query().Get("code"), nonce.Value, codeVerifier)
 	if err != nil {
 		return a.renderLoginPage(c, err)
 	}
@@ -255,6 +290,11 @@ func (a *App) OIDCFinish(c echo.Context) error {
 		} else {
 			return a.renderLoginPage(c, userErr)
 		}
+	}
+
+	// Disallow disabld users from logging in via OIDC.
+	if user.Status != auth.UserStatusEnabled {
+		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusForbidden, a.i18n.T("users.invalidLogin")))
 	}
 
 	// Update the user login state (avatar, logged in date) in the DB.
@@ -426,9 +466,16 @@ func (a *App) createOIDCUser(claims auth.OIDCclaim, c echo.Context) (auth.User, 
 		name = strings.Split(claims.Email, "@")[0]
 	}
 
+	userRoleID, claimListRoleID := resolveOIDCRoles(
+		claims.RawClaims,
+		a.cfg.Security.OIDC.Roles,
+		a.cfg.Security.OIDC.DefaultUserRoleID,
+		a.cfg.Security.OIDC.DefaultListRoleID,
+	)
+
 	var listRoleID *int
-	if a.cfg.Security.OIDC.DefaultListRoleID > 0 {
-		listRoleID = &a.cfg.Security.OIDC.DefaultListRoleID
+	if claimListRoleID > 0 {
+		listRoleID = &claimListRoleID
 	}
 
 	user, err := a.core.CreateUser(auth.User{
@@ -438,7 +485,7 @@ func (a *App) createOIDCUser(claims auth.OIDCclaim, c echo.Context) (auth.User, 
 		Username:      claims.Email,
 		Name:          name,
 		Email:         null.NewString(claims.Email, true),
-		UserRoleID:    a.cfg.Security.OIDC.DefaultUserRoleID,
+		UserRoleID:    userRoleID,
 		ListRoleID:    listRoleID,
 		Status:        auth.UserStatusEnabled,
 	})
@@ -791,4 +838,88 @@ func (a *App) GenerateTOTPQR(c echo.Context) error {
 		Secret: key.Secret(),
 		QR:     base64.StdEncoding.EncodeToString(buf.Bytes()),
 	}})
+}
+
+// resolveOIDCRoles applies the first matching mapping, retaining defaults for omitted roles.
+func resolveOIDCRoles(claims map[string]json.RawMessage, roles []models.OIDCRoleMapping, userRoleID, listRoleID int) (int, int) {
+	for _, m := range roles {
+		if !oidcClaimMatches(claims[m.Claim], m.Match) {
+			continue
+		}
+
+		if m.UserRoleID != nil {
+			userRoleID = *m.UserRoleID
+		}
+
+		if m.ListRoleID != nil {
+			listRoleID = *m.ListRoleID
+		}
+
+		break
+	}
+
+	return userRoleID, listRoleID
+}
+
+// oidcClaimMatches accepts only strings and arrays containing exclusively strings.
+func oidcClaimMatches(raw json.RawMessage, expected string) bool {
+	var claim any
+	if err := json.Unmarshal(raw, &claim); err != nil {
+		return false
+	}
+
+	switch v := claim.(type) {
+	case string:
+		return v == expected
+	case []any:
+		matched := false
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return false
+			}
+			matched = matched || s == expected
+		}
+
+		return matched
+	}
+
+	return false
+}
+
+// validateOIDCRoles checks mapping fields and references to each role type.
+func validateOIDCRoles(roles []models.OIDCRoleMapping, userRoles []auth.Role, listRoles []auth.ListRole) error {
+	for i, m := range roles {
+		var msg string
+		switch {
+		case m.Claim == "":
+			msg = "claim is required"
+		case m.Match == "":
+			msg = "match is required"
+		case m.UserRoleID != nil && !slices.ContainsFunc(userRoles, func(r auth.Role) bool { return r.ID == *m.UserRoleID }):
+			msg = fmt.Sprintf("user role ID %d does not exist", *m.UserRoleID)
+		case m.ListRoleID != nil && !slices.ContainsFunc(listRoles, func(r auth.ListRole) bool { return r.ID == *m.ListRoleID }):
+			msg = fmt.Sprintf("list role ID %d does not exist", *m.ListRoleID)
+		}
+
+		if msg != "" {
+			return fmt.Errorf("OIDC role mapping %d: %s", i+1, msg)
+		}
+	}
+
+	return nil
+}
+
+// validateOIDCSettings checks defaults even when automatic user creation is disabled.
+func validateOIDCSettings(set models.Settings, userRoles []auth.Role, listRoles []auth.ListRole) error {
+	o := set.OIDC
+	if o.AutoCreateUsers || o.DefaultUserRoleID.Valid {
+		if !o.DefaultUserRoleID.Valid || !slices.ContainsFunc(userRoles, func(r auth.Role) bool { return r.ID == o.DefaultUserRoleID.Int }) {
+			return fmt.Errorf("OIDC default user role ID %d does not exist", o.DefaultUserRoleID.Int)
+		}
+	}
+	if o.DefaultListRoleID.Valid && !slices.ContainsFunc(listRoles, func(r auth.ListRole) bool { return r.ID == o.DefaultListRoleID.Int }) {
+		return fmt.Errorf("OIDC default list role ID %d does not exist", o.DefaultListRoleID.Int)
+	}
+	return validateOIDCRoles(o.Roles, userRoles, listRoles)
 }

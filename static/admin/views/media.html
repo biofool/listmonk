@@ -1,0 +1,9 @@
+{{ define "admin-media" -}}
+{{ template "admin-header" . }}
+
+{{ template "media-gallery" dict "Root" . "Mode" "manage" }}
+
+<script type="module" src="{{ URI "/admin/static/js/views/media.js" }}?v={{ .AssetVersion }}" defer></script>
+
+{{ template "admin-footer" . -}}
+{{ end }}

@@ -38,8 +38,7 @@ type serverConfig struct {
 	Version       string          `json:"version"`
 }
 
-// GetServerConfig returns general server config.
-func (a *App) GetServerConfig(c echo.Context) error {
+func (a *App) makeServerConfig() (serverConfig, error) {
 	out := serverConfig{
 		RootURL:       a.urlCfg.RootURL,
 		FromEmail:     a.cfg.FromEmail,
@@ -78,8 +77,7 @@ func (a *App) GetServerConfig(c echo.Context) error {
 	// Language list.
 	langList, err := getI18nLangList(a.fs)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError,
-			fmt.Sprintf("Error loading language list: %v", err))
+		return out, fmt.Errorf("error loading language list: %v", err)
 	}
 	out.Langs = langList
 
@@ -93,6 +91,37 @@ func (a *App) GetServerConfig(c echo.Context) error {
 	out.Update = a.update
 	a.Unlock()
 	out.Version = versionString
+
+	return out, nil
+}
+
+func (a *App) makeAdminJSI18n() json.RawMessage {
+	var lang map[string]string
+	if err := json.Unmarshal(a.i18n.JSON(), &lang); err != nil {
+		return json.RawMessage("{}")
+	}
+
+	out := make(map[string]string, len(a.cfg.AdminI18nKeys))
+	for _, key := range a.cfg.AdminI18nKeys {
+		if val, ok := lang[key]; ok {
+			out[key] = val
+		}
+	}
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return b
+}
+
+// GetServerConfig returns general server config.
+func (a *App) GetServerConfig(c echo.Context) error {
+	out, err := a.makeServerConfig()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError,
+			fmt.Sprintf("Error loading server config: %v", err))
+	}
 
 	return c.JSON(http.StatusOK, okResp{out})
 }
