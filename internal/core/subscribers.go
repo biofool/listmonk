@@ -409,7 +409,10 @@ func (c *Core) UpdateSubscriber(id int, sub models.Subscriber) (models.Subscribe
 			c.i18n.Ts("globals.messages.errorUpdating", "name", "{globals.terms.subscriber}", "error", pqErrMsg(err)))
 	}
 
-	out, err := c.GetSubscriber(sub.ID, "", sub.Email)
+	// Refetch by the path id (the permission-checked target), not sub.ID —
+	// a request body naming a different subscriber would otherwise leak
+	// that subscriber's profile in the response (IDOR).
+	out, err := c.GetSubscriber(id, "", "")
 	if err != nil {
 		return models.Subscriber{}, err
 	}
@@ -455,7 +458,7 @@ func (c *Core) UpdateSubscriberWithLists(id int, sub models.Subscriber, listIDs 
 			c.i18n.Ts("globals.messages.errorUpdating", "name", "{globals.terms.subscriber}", "error", pqErrMsg(err)))
 	}
 
-	out, err := c.GetSubscriber(sub.ID, "", sub.Email)
+	out, err := c.GetSubscriber(id, "", "")
 	if err != nil {
 		return models.Subscriber{}, false, err
 	}

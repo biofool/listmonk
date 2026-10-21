@@ -265,7 +265,7 @@ INSERT INTO settings (key, value) VALUES
     ('security.trusted_urls', '[]'),
     ('upload.provider', '"filesystem"'),
     ('upload.max_file_size', '5000'),
-    ('upload.extensions', '["jpg","jpeg","png","gif","svg","*"]'),
+    ('upload.extensions', '["jpg","jpeg","png","gif","webp"]'),
     ('upload.filesystem.upload_path', '"uploads"'),
     ('upload.filesystem.upload_uri', '"/uploads"'),
     ('upload.s3.url', '"https://ap-south-1.s3.amazonaws.com"'),

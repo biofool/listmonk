@@ -624,6 +624,30 @@ func (a *App) PublicSubscription(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("public.invalidFeature"))
 	}
 
+	// Process CAPTCHA — same gate as the form handler; skipping it here made
+	// the API a scripted-subscription / opt-in email-bombing vector.
+	if a.captcha.IsEnabled() {
+		var val string
+		switch a.captcha.GetProvider() {
+		case captcha.ProviderHCaptcha:
+			val = c.FormValue("h-captcha-response")
+		case captcha.ProviderAltcha:
+			val = c.FormValue("altcha")
+		default:
+			return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("public.invalidCaptcha"))
+		}
+		if val == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("public.invalidCaptcha"))
+		}
+		cerr, ok := a.captcha.Verify(val)
+		if cerr != nil {
+			a.log.Printf("captcha request failed: %v", cerr)
+		}
+		if !ok {
+			return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("public.invalidCaptcha"))
+		}
+	}
+
 	hasOptin, err := a.processSubForm(c)
 	if err != nil {
 		return err

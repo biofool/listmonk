@@ -144,9 +144,10 @@ func (a *Azure) verifyAuth(req *http.Request) error {
 		querySecretParam    = "code"
 	)
 
-	// If no local credential is configured, allow webhook payloads.
+	// Fail closed: an empty configured secret must not silently disable
+	// authentication — a forged bounce would auto-blocklist subscribers.
 	if a.sharedSecret == "" {
-		return nil
+		return errors.New("azure webhook shared secret is not configured")
 	}
 
 	if req == nil {

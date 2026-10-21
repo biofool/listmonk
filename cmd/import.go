@@ -112,6 +112,12 @@ func (a *App) ImportSubscribers(c echo.Context) error {
 			a.i18n.Ts("import.invalidFile", "error", err.Error()))
 	}
 
+	// Enforce upload.max_file_size (MB) — see media.go.
+	if maxMB := a.cfg.MediaUpload.MaxFileSize; maxMB > 0 && file.Size > int64(maxMB)<<20 {
+		return echo.NewHTTPError(http.StatusBadRequest,
+			a.i18n.Ts("import.invalidFile", "error", "file too large"))
+	}
+
 	src, err := file.Open()
 	if err != nil {
 		return err
@@ -139,6 +145,14 @@ func (a *App) ImportSubscribers(c echo.Context) error {
 			a.i18n.Ts("import.errorStarting", "error", err.Error()))
 	}
 	go sess.Start()
+	// If we bail out below, stop the session so the Start() goroutine
+	// doesn't block forever.
+	started := false
+	defer func() {
+		if !started {
+			sess.Stop()
+		}
+	}()
 
 	if strings.HasSuffix(strings.ToLower(file.Filename), ".csv") {
 		go sess.LoadCSV(out.Name(), rune(opt.Delim[0]))
@@ -157,6 +171,7 @@ func (a *App) ImportSubscribers(c echo.Context) error {
 
 		go sess.LoadCSV(dir+"/"+files[0], rune(opt.Delim[0]))
 	}
+	started = true
 
 	return c.JSON(http.StatusOK, okResp{a.importer.GetStats()})
 }

@@ -98,6 +98,7 @@ func (s *SES) ProcessSubscription(b []byte) error {
 	if err != nil {
 		return fmt.Errorf("error requesting subscription URL: %v", err)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("non 200 response on subscription URL: %v", resp.StatusCode)
