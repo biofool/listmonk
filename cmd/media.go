@@ -108,6 +108,23 @@ func (a *App) UploadMedia(c echo.Context) error {
 		contentType = file.Header.Get("Content-Type")
 	)
 
+	// Enforce upload.max_file_size (MB) — the setting existed but nothing
+	// read it, so uploads were unbounded.
+	if maxMB := a.cfg.MediaUpload.MaxFileSize; maxMB > 0 && file.Size > int64(maxMB)<<20 {
+		return echo.NewHTTPError(http.StatusBadRequest,
+			a.i18n.Ts("media.unsupportedFileType", "type", "exceeds upload.max_file_size"))
+	}
+
+	// Script-capable extensions are never acceptable — uploads are served
+	// same-origin, so html/svg/js/xml content would execute in the admin
+	// session regardless of the configured allowlist (even "*").
+	blocked := map[string]bool{"html": true, "htm": true, "xhtml": true,
+		"svg": true, "xml": true, "js": true}
+	if blocked[ext] {
+		return echo.NewHTTPError(http.StatusBadRequest,
+			a.i18n.Ts("media.unsupportedFileType", "type", ext))
+	}
+
 	// Validate file extension.
 	if !inArray("*", a.cfg.MediaUpload.Extensions) {
 		if ok := inArray(ext, a.cfg.MediaUpload.Extensions); !ok {

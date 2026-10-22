@@ -424,6 +424,7 @@ func (a *App) renderLoginPage(c echo.Context, loginErr error) error {
 		HttpOnly: true,
 		Path:     "/",
 		SameSite: http.SameSiteLaxMode,
+		Secure:   strings.HasPrefix(a.urlCfg.RootURL, "https"),
 	})
 	out.Nonce = nonce
 

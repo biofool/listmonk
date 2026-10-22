@@ -101,6 +101,12 @@ type Manager struct {
 	campMsgQ  chan CampaignMessage
 	msgQ      chan models.Message
 
+	// msgTokens is a shared rate bucket refilled once a second. Workers
+	// consume one token per message so cfg.MessageRate is the *global*
+	// rate — previously each of N workers counted its own quota, making
+	// the effective rate MessageRate x Concurrency.
+	msgTokens chan struct{}
+
 	// Sliding window keeps track of the total number of messages sent in a period
 	// and on reaching the specified limit, waits until the window is over before
 	// sending further messages.
@@ -190,6 +196,7 @@ func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
 		nextPipes:    make(chan *pipe, 1000),
 		campMsgQ:     make(chan CampaignMessage, cfg.Concurrency*cfg.MessageRate*2),
 		msgQ:         make(chan models.Message, cfg.Concurrency*cfg.MessageRate*2),
+		msgTokens:    make(chan struct{}, cfg.MessageRate),
 		slidingStart: time.Now(),
 	}
 	m.tplFuncs = m.makeGnericFuncMap()
@@ -285,6 +292,19 @@ func (m *Manager) Run() {
 		// to fetch subscribers from the campaign.
 		go m.scanCampaigns(m.cfg.ScanInterval)
 	}
+
+	// Refill the shared rate bucket every second.
+	go func() {
+		for range time.Tick(time.Second) {
+			for i := 0; i < m.cfg.MessageRate; i++ {
+				select {
+				case m.msgTokens <- struct{}{}:
+				default:
+					i = m.cfg.MessageRate
+				}
+			}
+		}
+	}()
 
 	// Spawn N message workers.
 	for i := 0; i < m.cfg.Concurrency; i++ {
@@ -488,8 +508,6 @@ func (m *Manager) scanCampaigns(tick time.Duration) {
 // worker is a blocking function that perpetually listents to events (message) on different
 // queues and processes them.
 func (m *Manager) worker() {
-	// Counter to keep track of the message / sec rate limit.
-	numMsg := 0
 	for {
 		select {
 		// Campaign message.
@@ -505,12 +523,9 @@ func (m *Manager) worker() {
 				continue
 			}
 
-			// Pause on hitting the message rate.
-			if numMsg >= m.cfg.MessageRate {
-				time.Sleep(time.Second)
-				numMsg = 0
-			}
-			numMsg++
+			// Consume a rate token — blocks until the next refill tick
+			// once the global per-second quota is spent.
+			<-m.msgTokens
 
 			// Outgoing message.
 			out := models.Message{

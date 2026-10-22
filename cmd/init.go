@@ -149,8 +149,9 @@ type Config struct {
 	CustomAssetVersion string
 
 	MediaUpload struct {
-		Provider   string
-		Extensions []string
+		Provider    string
+		Extensions  []string
+		MaxFileSize int
 	}
 
 	BounceWebhooksEnabled     bool
@@ -528,6 +529,7 @@ func initConstConfig(ko *koanf.Koanf) *Config {
 	c.Privacy.Exportable = koanfmaps.StringSliceToLookupMap(ko.Strings("privacy.exportable"))
 	c.MediaUpload.Provider = ko.String("upload.provider")
 	c.MediaUpload.Extensions = ko.Strings("upload.extensions")
+	c.MediaUpload.MaxFileSize = ko.Int("upload.max_file_size")
 	c.Privacy.DomainBlocklist = ko.Strings("privacy.domain_blocklist")
 	c.Privacy.DomainAllowlist = ko.Strings("privacy.domain_allowlist")
 
@@ -1042,7 +1044,18 @@ func initHTTPServer(cfg *Config, urlCfg *UrlConfig, i *i18n.I18n, fs stuffbin.Fi
 	)
 	switch {
 	case uploadProvider == "filesystem" && uploadFsURI != "":
-		srv.Static(uploadFsURI, ko.String("upload.filesystem.upload_path"))
+		// Uploads are user-controlled content served same-origin — force any
+		// active content (html/svg/js) inert and stop type sniffing.
+		inert := func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				h := c.Response().Header()
+				h.Set("Content-Security-Policy", "script-src 'none'; object-src 'none'")
+				h.Set("X-Content-Type-Options", "nosniff")
+				return next(c)
+			}
+		}
+		srv.GET(path.Join(uploadFsURI, "*"),
+			echo.StaticDirectoryHandler(os.DirFS(ko.String("upload.filesystem.upload_path")), false), inert)
 	case uploadProvider == "s3" && strings.HasPrefix(publicURL, "/"):
 		srv.GET(path.Join(publicURL, "/:filepath"), app.ServeS3Media)
 	}
@@ -1374,6 +1387,9 @@ func initAuth(co *core.Core, db *sql.DB, ko *koanf.Koanf) (bool, *auth.Auth) {
 		SetCookie: func(cookie *http.Cookie, w any) error {
 			c := w.(echo.Context)
 			cookie.SameSite = http.SameSiteLaxMode
+			// Session cookies ride on the app's public URL — mark them Secure
+			// when it's https so they can't leak over plaintext http.
+			cookie.Secure = strings.HasPrefix(ko.String("app.root_url"), "https")
 			c.SetCookie(cookie)
 			return nil
 		},
